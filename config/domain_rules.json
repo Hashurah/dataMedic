@@ -1,0 +1,38 @@
+{
+  "_comment": "Name-based rules. 'impossible' bounds mark values that cannot be real (set to missing and logged). 'expected' bounds mark values that are unusual for the field but may be legitimate (flagged only). Patterns are matched against the lower-cased column name with words split on _ - . and spaces.",
+  "rules": [
+    {"name": "age", "pattern": "(^|_)(age|age_years|patient_age|customer_age)($|_)", "impossible": {"min": 0, "max": 130}, "expected": {"min": 0, "max": 110}},
+    {"name": "latitude", "pattern": "(^|_)(lat|latitude)($|_)", "impossible": {"min": -90, "max": 90}},
+    {"name": "longitude", "pattern": "(^|_)(lon|lng|long|longitude)($|_)", "impossible": {"min": -180, "max": 180}},
+    {"name": "percentage", "pattern": "(^|_)(pct|percent|percentage)($|_)", "impossible_percent_scale": true},
+    {"name": "probability", "pattern": "(^|_)(prob|probability)($|_)", "impossible": {"min": 0, "max": 1}},
+    {"name": "count or quantity", "pattern": "(^|_)(qty|quantity|units|units_sold|count|num|number_of|items)($|_)", "expected": {"min": 0}, "note": "negative counts can be returns, refunds or adjustments"},
+    {"name": "price or cost", "pattern": "(^|_)(price|unit_price|cost|unit_cost|fee)($|_)", "expected": {"min": 0}, "note": "negative prices can be credits or corrections"},
+    {"name": "year", "pattern": "(^|_)(year|yr)($|_)", "impossible": {"min": 1000, "max": "current_year+50"}, "expected": {"min": 1900, "max": "current_year+1"}},
+    {"name": "month number", "pattern": "(^|_)(month|mon)($|_)", "impossible": {"min": 1, "max": 12}, "only_if_integer": true},
+    {"name": "hour", "pattern": "(^|_)(hour|hr)($|_)", "impossible": {"min": 0, "max": 24}, "only_if_integer": true},
+    {"name": "duration", "pattern": "(^|_)(duration|tenure|length_of_stay|los|days|minutes|seconds)($|_)", "expected": {"min": 0}},
+    {"name": "height in cm", "pattern": "(^|_)(height_cm)($|_)", "impossible": {"min": 20, "max": 280}},
+    {"name": "weight in kg", "pattern": "(^|_)(weight_kg)($|_)", "impossible": {"min": 0.2, "max": 700}}
+  ],
+  "date_pairs": [
+    ["start", "end"], ["begin", "end"], ["from", "to"], ["created", "updated"], ["created", "closed"],
+    ["order", "ship"], ["order", "delivery"], ["ship", "delivery"], ["admission", "discharge"],
+    ["admit", "discharge"], ["hire", "termination"], ["check_in", "check_out"], ["open", "close"],
+    ["birth", "death"], ["signup", "churn"], ["issue", "due"], ["dob", "visit"], ["birth", "visit"],
+    ["birth", "order"], ["birth", "transaction"], ["birth", "admission"], ["birth", "hire"]
+  ],
+  "future_ok_words": ["due", "expiry", "expires", "expiration", "end", "scheduled", "planned", "forecast", "target", "deadline", "renewal", "next", "maturity", "valid_until"],
+  "birth_words": ["birth", "dob", "born"],
+  "total_check": {
+    "quantity": ["quantity", "qty", "units", "units_sold"],
+    "price": ["unit_price", "price", "unit_cost"],
+    "total": ["total", "amount", "line_total", "revenue", "sales", "total_price", "subtotal"]
+  },
+  "identifier_words": ["id", "uuid", "guid", "key", "code", "sku", "number", "no", "num", "ref", "reference", "account", "acct", "zip", "postcode", "postal", "phone", "mobile", "tel", "iban", "isbn", "ean", "upc", "ssn", "nin", "passport", "invoice", "order_id", "transaction_id"],
+  "target_words": ["target", "label", "outcome", "churn", "churned", "converted", "conversion", "default", "defaulted", "survived", "fraud", "is_fraud", "response", "class", "y", "attrition", "readmitted", "diagnosis"],
+  "split_words": ["split", "set", "fold", "partition", "dataset", "subset"],
+  "sensitive_name_words": ["name", "first_name", "last_name", "surname", "full_name", "email", "e_mail", "phone", "mobile", "tel", "telephone", "address", "street", "ssn", "social_security", "nin", "passport", "dob", "date_of_birth", "birth_date", "birthdate", "ip", "ip_address", "credit_card", "card_number", "iban", "account_number", "license", "licence", "national_id", "tax_id", "salary", "diagnosis", "medical_record", "mrn", "patient_id"],
+  "sensitive_name_exclusions": ["product_name", "company_name", "category_name", "store_name", "brand_name", "item_name", "region_name", "campaign_name", "channel_name", "file_name", "filename", "sheet_name", "city_name", "country_name", "department_name", "username_hash"],
+  "measure_priority_words": ["revenue", "sales", "amount", "total", "profit", "margin", "price", "cost", "quantity", "qty", "units", "spend", "income", "salary", "score", "value", "balance", "duration", "count"]
+}

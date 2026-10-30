@@ -1,0 +1,54 @@
+{
+  "_comment": "Default thresholds for dataMedic. Copy this file and pass --config to change them; the copy used is recorded in the run's metadata.",
+  "seed": 42,
+  "missing_tokens": {
+    "always": ["", "null", "NULL", "Null", "NaN", "nan", "#N/A", "#NA", "#VALUE!", "#DIV/0!", "#REF!", "#NULL!", "<NA>", "NaT"],
+    "in_numeric_or_date_columns": ["NA", "N/A", "n/a", "na", "N.A.", "None", "none", "nil", "-", "--", "---", "?", "??", ".", "missing", "Missing", "unknown", "Unknown", "UNKNOWN", "not available", "Not Available", "not applicable", "Not Applicable", "tbd", "TBD", "n.v.", "x", "X"],
+    "review_in_text_columns": ["NA", "N/A", "n/a", "na", "None", "none", "nil", "-", "--", "?", "unknown", "Unknown", "UNKNOWN", "not available", "Not Available", "not applicable", "Not Applicable", "missing", "Missing", "tbd", "TBD", "0"]
+  },
+  "sentinel_numbers": [-999999, -99999, -9999, -999, -99, 999, 9999, 99999, 999999, 9999999],
+  "type_inference": {
+    "parse_share_for_conversion": 0.95,
+    "max_failed_share_to_convert": 0.05,
+    "categorical_max_unique_share": 0.5,
+    "categorical_max_levels": 200,
+    "free_text_min_avg_length": 40,
+    "identifier_min_unique_share": 0.95
+  },
+  "missing": {
+    "leave_missing_above_share": 0.4,
+    "impute_numeric_up_to_share": 0.3,
+    "mode_impute_categorical_up_to_share": 0.05,
+    "skew_threshold_for_median": 0.5,
+    "add_indicator": true,
+    "association_alpha": 0.01
+  },
+  "outliers": {
+    "iqr_k": 1.5,
+    "iqr_k_extreme": 3.0,
+    "z_threshold": 3.0,
+    "modified_z_threshold": 3.5,
+    "min_n": 20
+  },
+  "categories": {
+    "rare_share": 0.01,
+    "fuzzy_similarity": 0.88,
+    "near_constant_share": 0.99,
+    "high_cardinality_levels": 50
+  },
+  "eda": {
+    "max_numeric_columns": 30,
+    "max_group_levels": 20,
+    "max_tests": 200,
+    "alpha": 0.05,
+    "strong_correlation": 0.5,
+    "collinearity_correlation": 0.85,
+    "max_charts": 24,
+    "scatter_sample": 5000,
+    "normality_sample": 5000
+  },
+  "large_data": {
+    "warn_file_mb": 500,
+    "default_sample_rows": 200000
+  }
+}
