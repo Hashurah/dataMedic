@@ -3,10 +3,12 @@
 
   discover FILE [FILE ...]          what is in the file(s): format, encoding, sheets, tables, shape
   profile  FILE [--out DIR]         baseline profile, issues and a proposed plan.json (changes nothing)
-  clean    OUT                      apply OUT/plan.json; writes cleaned data and the audit trail
-  validate OUT                      independent checks, including revert and replay
+  clean    OUT [--safe-only | --max-risk LEVEL]  apply OUT/plan.json; writes cleaned data and the audit trail
+  validate OUT [--contract FILE]    independent checks, including revert, replay and a data contract
   eda      OUT [--target C --time C]  exploratory analysis and tests on the cleaned data
-  report   OUT                      generated reports (quality, EDA, HTML audit, Excel audit)
+  report   OUT [--interactive]      generated reports (quality, EDA, HTML audit, Excel audit)
+  compare  OUT COLUMN               masked-value comparison of imputation methods for one column
+  restore  OUT --op OP-ID           copy of the cleaned data with one step undone (cleaned data untouched)
   calc     OUT NAME EXPR            record a derived number (for example a growth rate) for review
   review   OUT                      final review: deliverables, numbers traceable, writing style
   revert   OUT [--to FILE]          rebuild the original table from cleaned data + audit files
@@ -71,7 +73,8 @@ if __name__ == "__main__":
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from datamedic.common import ROW_ID, DataMedicError, fmt_num, read_json  # noqa: E402
+from datamedic import term  # noqa: E402
+from datamedic.common import ROW_ID, DataMedicError, fmt_num, read_json, write_json  # noqa: E402
 
 
 def _print_json(obj):
@@ -148,28 +151,35 @@ def cmd_clean(a):
     src = man["input"]["path"]
     if not os.path.exists(src):
         src = os.path.join(a.out, man["input"]["reference_copy"])
-    eng = run_clean(src, plan, a.out)
+    max_risk = "safe" if a.safe_only else a.max_risk
+    eng = run_clean(src, plan, a.out, max_risk=max_risk)
     r = read_json(os.path.join(a.out, "metadata", "analysis_manifest.json"))["result"]
     print(f"Rows {fmt_num(r['rows_before'])} -> {fmt_num(r['rows_after'])}; columns {r['columns_before']} -> "
-          f"{r['columns_after']}; values changed {fmt_num(r['cells_changed'])}; rows removed {r['rows_removed']}; "
-          f"rows flagged {r['rows_flagged']}")
+          f"{r['columns_after']}; values changed {fmt_num(r['cells_changed'])}; rows removed {r['rows_removed']}"
+          f" (of which quarantined {r.get('rows_quarantined', 0)}); rows flagged {r['rows_flagged']}")
     print(f"Operations: {r['operations_applied']} applied, {r['operations_disabled']} disabled, "
-          f"{r['operations_failed']} failed")
+          f"{r['operations_failed']} failed" + (f", {r['operations_held_by_risk_limit']} held back by the "
+                                               f"'{max_risk}' risk limit" if max_risk else ""))
     for e in eng.log:
         if e.get("status") == "failed":
-            print(f"  FAILED {e['op_id']} {e['op']} {e.get('column', '')}: {e.get('error')}")
+            term.line(f"  FAILED {e['op_id']} {e['op']} {e.get('column', '')}: {e.get('error')}", "fail")
+        elif "above this run's limit" in str(e.get("status", "")):
+            term.line(f"  held   {e['op_id']} {e['op']} {e.get('column', '')} (risk {e.get('risk')})", "warn")
     return 1 if r["operations_failed"] else 0
 
 
 def cmd_validate(a):
     from datamedic.pipeline import mark
     from datamedic.validate import validate
-    res = validate(a.out, replay=not a.no_replay)
+    res = validate(a.out, replay=not a.no_replay, contract_path=a.contract)
     mark(a.out, "validate", "done" if res["status"] != "FAILED" else "failed")
-    print(f"Validation: {res['status']} ({res['critical_failures']} critical, {res['warnings']} warnings)")
+    kind = "ok" if res["status"] == "PASSED" else "fail" if res["status"] == "FAILED" else "warn"
+    term.line(f"Validation: {res['status']} ({res['critical_failures']} critical, {res['warnings']} warnings, "
+              f"{sum(c['passed'] for c in res['checks'])}/{len(res['checks'])} checks passed)", kind)
     for c in res["checks"]:
-        print(f"  {'ok  ' if c['passed'] else 'FAIL' if c['severity'] == 'critical' else 'warn'} {c['check']}"
-              + (f": {c['detail']}" if c["detail"] else ""))
+        k = "ok" if c["passed"] else "fail" if c["severity"] == "critical" else "warn"
+        term.line(f"  {'ok  ' if c['passed'] else 'FAIL' if c['severity'] == 'critical' else 'warn'} {c['check']}"
+                  + (f": {c['detail']}" if c["detail"] else ""), None if c["passed"] else k)
     if res["open_review_items"]:
         print("Open decisions (disabled, need review): " + ", ".join(res["open_review_items"]))
     return 2 if res["status"] == "FAILED" else 0
@@ -191,7 +201,7 @@ def cmd_eda(a):
 def cmd_report(a):
     from datamedic.pipeline import mark
     from datamedic.report import build_reports
-    for f in build_reports(a.out):
+    for f in build_reports(a.out, interactive=True if a.interactive else None):
         print("Written: " + f)
     mark(a.out, "report")
     return 0
@@ -234,6 +244,64 @@ def cmd_revert(a):
     return 0 if eq else 2
 
 
+def cmd_restore(a):
+    from datamedic.clean import restore_step
+    df, rep_ = restore_step(a.out, a.op)
+    dest = a.to or os.path.join(a.out, "restored", f"cleaned_without_{a.op}.csv")
+    os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+    df.to_csv(dest, index=False, encoding="utf-8", lineterminator="\n")
+    write_json(os.path.splitext(dest)[0] + "_report.json", rep_)
+    print(f"{a.op} ({rep_['op']}) undone in a copy: {rep_['cells_restored']} cells and {rep_['rows_restored']} rows "
+          f"restored" + (f", columns back: {', '.join(rep_['columns_restored'])}" if rep_["columns_restored"] else "")
+          + (f", indicator dropped: {', '.join(rep_['columns_dropped'])}" if rep_["columns_dropped"] else ""))
+    for n in rep_["notes"]:
+        term.line("  note: " + n, "warn")
+    print(f"Written: {dest} (the cleaned data in cleaned_data/ is unchanged)")
+    return 0
+
+
+def cmd_compare(a):
+    from datamedic.clean import Engine
+    from datamedic.common import merged_config, optional
+    from datamedic.impute_eval import candidates_for, compare_methods
+    from datamedic.loader import load_table
+    from datamedic.pipeline import load_manifest
+    man = load_manifest(a.out)
+    plan = read_json(os.path.join(a.out, "plan.json"))
+    src = man["input"]["path"] if os.path.exists(man["input"]["path"]) else os.path.join(a.out, man["input"]["reference_copy"])
+    lo = man.get("load_options", {})
+    raw, _ = load_table(src, sheet=lo.get("sheet"), table=lo.get("table"), block=lo.get("block"),
+                        sample=lo.get("sample"), seed=lo.get("seed", 42))
+    pre = [o for o in plan["operations"] if o.get("enabled", True) and o["op"] not in ("impute", "winsorize")]
+    df = Engine(raw, {"operations": pre, "settings": plan.get("settings", {})}).run().df
+    if a.column not in df.columns:
+        raise DataMedicError(f"column '{a.column}' is not in the data after the plan's other steps")
+    cfg = merged_config(plan.get("settings", {}).get("config"))
+    s = df[a.column]
+    numeric = s.dtype.kind in "fi" or str(s.dtype) == "Int64"
+    cats = [c for c in (a.group_by or plan.get("roles", {}).get("category", [])) if c in df.columns and c != a.column]
+    nums = [c for c in df.columns if c not in (a.column, ROW_ID) and (df[c].dtype.kind in "fi" or str(df[c].dtype) == "Int64")]
+    specs = candidates_for(df, a.column, numeric, cats, nums, a.time, sklearn=optional("sklearn") is not None)
+    res = compare_methods(df, a.column, specs, cfg, cfg.get("seed", 42), group_for_subgroups=cats[0] if cats else None)
+    path = os.path.join(a.out, "analysis", f"imputation_comparison_{''.join(ch if ch.isalnum() else '_' for ch in a.column)}.json")
+    write_json(path, res)
+    if res.get("status") != "ok":
+        print(f"{a.column}: {res.get('status')}")
+        return 0
+    key = "nmae" if res["kind"] == "numeric" else "accuracy"
+    rows = [[n, f"{m[key]:.3f}" if m.get(key) is not None else "", f"{m['coverage'] * 100:.0f}%",
+             fmt_num(m.get("bias")) if res["kind"] == "numeric" else fmt_num(m.get("macro_f1"))]
+            if m.get("status") == "ok" else [n, "could not run", "", m.get("error", "")[:50]]
+            for n, m in sorted(res["methods"].items(), key=lambda t: t[0] != res["best"])]
+    term.table(["Method", "normalised MAE" if key == "nmae" else "accuracy", "filled",
+                "bias" if key == "nmae" else "macro-F1"], rows,
+               title=f"{a.column}: {res['masked_per_repeat']} known values hidden x {res['repeats']} (best first)")
+    for lim in res["limitations"]:
+        print("  limitation: " + lim)
+    print(f"Written: {path}")
+    return 0
+
+
 def cmd_relate(a):
     from datamedic.relations import relate
     res = relate(a.parent, a.child, sheet_p=a.parent_sheet, sheet_c=a.child_sheet)
@@ -256,10 +324,13 @@ def cmd_check(a):
     v = versions()
     print(f"Python: {sys.executable} ({v['python']})")
     print(f"Environment: {'skill .venv' if os.path.join(SKILL_DIR, '.venv') in sys.executable else 'DATAMEDIC_PYTHON' if os.environ.get('DATAMEDIC_PYTHON') else 'current Python'}")
-    for k in ("pandas", "numpy", "scipy", "matplotlib", "openpyxl", "pyarrow", "sklearn"):
+    for k in ("pandas", "numpy", "scipy", "matplotlib", "seaborn", "openpyxl", "pyarrow", "sklearn", "plotly", "rich"):
         print(f"  {k:11} {v[k]}")
     notes = {"scipy": "statistical tests are skipped", "matplotlib": "no charts", "openpyxl": "no Excel input or copies",
-             "pyarrow": "no Parquet or Feather input", "sklearn": "no KNN or iterative imputation"}
+             "pyarrow": "no Parquet or Feather input",
+             "sklearn": "no KNN or iterative imputation, no Isolation Forest (a simpler robust distance is used)",
+             "seaborn": "charts are drawn with matplotlib alone", "plotly": "no interactive charts in the HTML report",
+             "rich": "plain terminal output"}
     for k, why in notes.items():
         if v[k] == "not installed":
             print(f"Without {k}: {why}.")
@@ -273,13 +344,27 @@ def cmd_run(a):
     a.force_plan = True
     steps = [cmd_profile, cmd_clean, cmd_validate, cmd_eda, cmd_report]
     a.plan, a.no_replay, a.target, a.time, a.no_charts = None, False, a.target, a.time, a.no_charts
+    a.contract, a.interactive = getattr(a, "contract", None), getattr(a, "interactive", False)
+    a.safe_only, a.max_risk = getattr(a, "safe_only", False), getattr(a, "max_risk", None)
+    term.heading("dataMedic: profile, clean, validate, explore, report")
     worst = 0
     for s in steps:
-        print(f"\n--- {s.__name__[4:]}")
+        term.heading(s.__name__[4:])
         rc = s(a)
         worst = max(worst, rc)
         if rc == 1:
             return 1
+    f = os.path.join(out, "reports", "summary_facts.json")
+    if os.path.exists(f):
+        sf = read_json(f)
+        val = read_json(os.path.join(out, "audit", "validation_results.json"))
+        rows = [["Original records", fmt_num(sf["rows_before"])], ["Final records", fmt_num(sf["rows_after"])],
+                ["Values imputed", fmt_num(sf["missing_values_imputed"])],
+                ["Duplicates removed", fmt_num(sf["duplicate_rows_removed"])],
+                ["Rows quarantined", fmt_num(sf.get("rows_quarantined", 0))], ["Rows flagged", fmt_num(sf["rows_flagged"])],
+                ["Validation checks passed", f"{sum(c['passed'] for c in val['checks'])}/{len(val['checks'])}"],
+                ["Open decisions", ", ".join(sf["open_decisions"]) or "none"]]
+        term.table(["", ""], rows, title=f"Final summary: validation {sf['validation_status']}")
     print("\nNext: write reports/executive_summary.md and reports/insights_and_recommendations.md from "
           "templates/, then run 'review'.")
     return worst
@@ -313,10 +398,15 @@ def main(argv=None):
     s = sub.add_parser("clean")
     s.add_argument("out")
     s.add_argument("--plan")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--safe-only", action="store_true", help="apply only steps that cannot lose information")
+    g.add_argument("--max-risk", choices=["safe", "moderate", "high"],
+                   help="apply enabled steps up to this risk level; higher ones are recorded as held back")
     s.set_defaults(fn=cmd_clean)
     s = sub.add_parser("validate")
     s.add_argument("out")
     s.add_argument("--no-replay", action="store_true")
+    s.add_argument("--contract", help="data contract JSON (default: OUT/contract.json if present)")
     s.set_defaults(fn=cmd_validate)
     s = sub.add_parser("eda")
     s.add_argument("out")
@@ -326,7 +416,19 @@ def main(argv=None):
     s.set_defaults(fn=cmd_eda)
     s = sub.add_parser("report")
     s.add_argument("out")
+    s.add_argument("--interactive", action="store_true", help="add plotly charts (needs plotly; adds about 4 MB)")
     s.set_defaults(fn=cmd_report)
+    s = sub.add_parser("compare")
+    s.add_argument("out")
+    s.add_argument("column")
+    s.add_argument("--group-by", nargs="*", help="grouping columns to try for group-based methods")
+    s.add_argument("--time", help="date column for interpolation")
+    s.set_defaults(fn=cmd_compare)
+    s = sub.add_parser("restore")
+    s.add_argument("out")
+    s.add_argument("--op", required=True, help="the step to undo, e.g. OP-007")
+    s.add_argument("--to", help="output CSV (default OUT/restored/cleaned_without_<op>.csv)")
+    s.set_defaults(fn=cmd_restore)
     s = sub.add_parser("calc")
     s.add_argument("out")
     s.add_argument("name")

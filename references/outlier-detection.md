@@ -22,9 +22,40 @@ dataMedic computes several methods for each numeric column and reports all of th
 | Modified z-score (MAD) | 0.6745·abs(x − median) / MAD above 3.5 (Iglewicz and Hoaglin) | robust general screen | MAD = 0 when most values are equal |
 | Percentiles | below p0.5 or above p99.5, say | describing tails | always flags a fixed share, outliers or not |
 | Domain thresholds | from `domain_rules.json` | impossible and unusual values | needs the rule to exist |
-| Multivariate (Mahalanobis distance, Isolation Forest) | unusual combinations, for example a tall child with a low weight | when single-variable checks miss combination errors | needs enough data and a reason; not run by default |
+| Multivariate (robust distance, Isolation Forest) | unusual combinations, for example a tall child with a low weight | when single-variable checks miss combination errors | needs continuous measures and enough rows; flags only (see below) |
 
 The flag rule chosen automatically is IQR, or IQR on the log scale when skewness is above 1 and all values are positive. When IQR is zero (most values identical), no statistical outlier flag is created.
+
+## Multivariate anomalies
+
+`eda` scores rows on up to 12 continuous measures, each with at least 20 distinct values. Distance methods are meaningless on 1 to 5 ratings, where most values sit far from the median in robust units.
+
+- Values are scaled by median and MAD.
+- With scikit-learn, Isolation Forest and a robust Mahalanobis distance (minimum covariance determinant, cut-off at the chi-square 99.9th percentile) run together. A row is listed only when both flag it, which keeps the list short and less dependent on one model's settings.
+- Without scikit-learn, the robust distance ignores correlations, and the report says so.
+- At least 50 usable rows are needed.
+
+Results:
+
+- `analysis/multivariate_anomalies.csv`: one row per flagged record, with its scores and its three main drivers;
+- `eda_results.json` under `multivariate.anomalies`;
+- a chart of the two main components.
+
+Nothing is changed. A listed row is a lead to investigate, like any other flag.
+
+## Kinds of unusual value
+
+Classify before acting. The class decides the treatment:
+
+| Class | Example | Default treatment |
+|---|---|---|
+| statistical outlier | far from the bulk on one measure | keep and flag |
+| data-entry error | 1,000 where the receipt says 100; age 230 | correct only with independent evidence; otherwise set to missing if impossible |
+| domain violation | negative age, latitude 95 | set to missing (logged), or quarantine the row if the whole record is doubtful |
+| multivariate anomaly | an ordinary price with an extraordinary quantity for that product | flag, investigate the row |
+| legitimate extreme | a very large but real order | keep; consider analyses that are robust to it |
+
+When a treatment is justified, compare the consequences before choosing. Put the mean, median and sd with the values kept, winsorised and excluded side by side, as your own pandas step saved under `analysis/`. Record the original values: winsorising and exclusion are logged and reversible.
 
 ## Investigating a flagged value
 

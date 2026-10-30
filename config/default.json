@@ -50,5 +50,46 @@
   "large_data": {
     "warn_file_mb": 500,
     "default_sample_rows": 200000
+  },
+  "_comment_imputation": "Masked-value comparison: hide a share of known values, fill them with each candidate method fitted on the rest, and compare with the truth. Evidence levels map the comparison and the amount of supporting data to a qualitative level; see references/imputation.md for the reasoning behind each number.",
+  "imputation_comparison": {
+    "enabled": true,
+    "min_observed": 40,
+    "mask_share": 0.2,
+    "max_masked": 2000,
+    "repeats": 3,
+    "switch_if_error_lower_by": 0.1
+  },
+  "imputation_evidence": {
+    "insufficient_below_support": 3,
+    "limited_below_support": 10,
+    "strong_min_support": 30,
+    "good_normalised_mae": 0.5,
+    "max_normalised_mae": 0.9,
+    "good_accuracy": 0.8,
+    "usable_accuracy": 0.5,
+    "max_gap_for_strong": 1
+  },
+  "time_series": {
+    "max_gap_steps": 3,
+    "_why": "A straight line between neighbours is a fair local estimate for a few missing steps; across longer gaps it hides whatever happened there, so longer runs are left missing."
+  },
+  "anomalies": {
+    "max_features": 12,
+    "min_distinct": 20,
+    "min_rows": 50,
+    "contamination": "auto",
+    "max_rows_listed": 200,
+    "robust_distance_quantile": 0.999
+  },
+  "report": {
+    "preview_rows": 500,
+    "interactive": false,
+    "redact_sensitive": true
+  },
+  "charts": {
+    "formats": ["png"],
+    "dpi": 150,
+    "use_seaborn": "auto"
   }
 }

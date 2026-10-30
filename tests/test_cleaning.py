@@ -213,7 +213,14 @@ def test_sensitive_values_are_masked_in_reports(runs):
 def test_time_series_interpolation_and_gaps(runs):
     r = runs("timeseries")
     o = ops(r, "impute", "daily_sales")[0]
-    assert o["params"]["method"] == "interpolate" and o["params"]["order_by"] == "date"
+    # interpolation over time is the first proposal; the masked-value check keeps it unless another method is
+    # clearly more accurate. Here 'visits' tracks sales closely while sales swing weekly, so a feature-based
+    # method wins on hidden known values, and the plan records both scores.
+    sc = o["evidence"]["strategy_comparison"]
+    assert "interpolate" in sc["methods"]
+    assert sc["methods"][sc["chosen"]]["nmae"] <= sc["methods"]["interpolate"]["nmae"]
+    assert o["params"]["method"] == "interpolate" or "interpolate" in sc["rejected"]
+    assert "Masked-value check" in o["rationale"]
     ts = r["eda"]["time_series"]
     assert ts["missing_steps"] == 7
     assert any(g["missing_steps"] == 7 for g in ts["gaps"])
@@ -256,6 +263,33 @@ def test_knn_imputation_runs_when_requested(tmp_path):
     res = read_str_csv(os.path.join(out, "cleaned_data", "cleaned_dataset.csv"))
     filled = pd.to_numeric(res["b"])[:10]
     assert ((filled - 2 * a[:10]).abs() < 0.5).all()
+
+
+def test_lookup_imputation_fills_only_blanks_from_another_column(tmp_path):
+    import json
+    from datamedic.pipeline import run_clean, run_profile
+    from datamedic.validate import validate
+    names = ["James Smith", "Emma Smith", "John Doe", "Sarah Lee", "Guest Customer"] * 20
+    gender = ["Female", "Male", "", "", ""] * 20  # recorded values deliberately disagree with the names
+    p = tmp_path / "g.csv"
+    pd.DataFrame({"name": names, "gender": gender, "spend": range(100)}).to_csv(p, index=False)
+    out = str(tmp_path / "o")
+    run_profile(str(p), out)
+    plan = read_json(os.path.join(out, "plan.json"))
+    plan["operations"] = [o for o in plan["operations"] if o["params"].get("column") != "gender"] + [
+        {"op_id": "OP-900", "op": "impute", "enabled": True, "decided_by": "user", "rationale": "test",
+         "params": {"column": "gender", "method": "lookup", "source": "name", "match": "first_word",
+                    "mapping": {"James": "Male", "John": "Male", "Emma": "Female", "Sarah": "Female"}}},
+        {"op_id": "OP-901", "op": "impute", "enabled": True, "decided_by": "user", "rationale": "test",
+         "params": {"column": "gender", "method": "constant", "value": "Unspecified", "add_indicator": False}}]
+    with open(os.path.join(out, "plan.json"), "w") as fh:
+        json.dump(plan, fh)
+    run_clean(str(p), os.path.join(out, "plan.json"), out)
+    res = read_str_csv(os.path.join(out, "cleaned_data", "cleaned_dataset.csv"))
+    assert res["gender"][:5].tolist() == ["Female", "Male", "Male", "Female", "Unspecified"]
+    assert res["gender_was_missing"][:5].tolist() == ["false", "false", "true", "true", "true"]
+    v = validate(out)
+    assert v["status"] == "PASSED", [c for c in v["checks"] if not c["passed"]]
 
 
 def test_repeated_runs_are_identical(runs, tmp_path):

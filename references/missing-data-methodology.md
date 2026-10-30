@@ -28,6 +28,16 @@ The mechanism is then assessed, never asserted:
 
 Always report the uncertainty. "No relationship with the observed columns was found; MNAR cannot be ruled out."
 
+`profile` also writes `profiling/missingness.json` (shown in the HTML report's Missing values section):
+
+| Diagnostic | What it shows | Caveat |
+|---|---|---|
+| row patterns | which combinations of columns are missing together, and how often | descriptive |
+| columns missing together | pairs with a Jaccard overlap of at least 0.5 | a shared cause (one form page, one source system) is likely |
+| structural candidates | every row missing A is also missing B | often a skipped question by design ("car make" when "has car" is no), which is not lost data and must not be imputed |
+| over time | missing rate per period, chi-square across periods | a jump usually marks a change in collection, not in the world |
+| Little's MCAR test | one chi-square test of MCAR across the numeric columns (EM estimates) | assumes multivariate normality; low power with few rows or many patterns; rejecting it supports MAR or MNAR, not rejecting it does not prove MCAR |
+
 ## 3. Choose a treatment
 
 | Situation | Default | Reason |
@@ -36,7 +46,7 @@ Always report the uncertainty. "No relationship with the observed columns was fo
 | Outcome / target column | leave missing | imputing the outcome invents results; for modelling, drop those rows from training instead |
 | Missing share over 40% | leave missing; add an indicator if analysis needs one | the filled values would mostly report the fill value |
 | Numeric, 30–40% | proposed, disabled | decide whether filling is defensible for the analysis at hand |
-| Numeric, evenly spaced time series | time interpolation, no extrapolation | neighbours in time are the best evidence |
+| Numeric, evenly spaced time series | time interpolation, no extrapolation, runs over 3 steps left missing | neighbours in time are the best evidence (see `time-series.md`) |
 | Numeric, missingness related to a group (MAR) | group median or mean | a single overall value would bias the groups |
 | Numeric, skewed (abs skew > 0.5) or with outliers | median | the mean is pulled by the tail |
 | Numeric, roughly symmetric | mean | |
@@ -44,6 +54,8 @@ Always report the uncertainty. "No relationship with the observed columns was fo
 | Categorical, otherwise | leave missing; an explicit "Missing" category is proposed | keeps the rows visible without guessing a label |
 | Value known from the domain | `constant` (for example discount 0) | only when the meaning is certain; record why |
 | Several correlated numeric columns | `knn` or `iterative` (scikit-learn) | uses the relationships; seeded and logged |
+
+This table gives the first proposal. The planner then compares it with the alternatives on hidden known values and switches only to a clearly better method. The comparison, the rejected methods and the reason are recorded in the step (see `imputation.md`).
 
 Never:
 
@@ -54,7 +66,7 @@ Never:
 
 ## 4. Keep the information that values were missing
 
-Every imputation adds `<column>_was_missing` (true/false) unless you turn it off, and the change log lists every filled cell. Analyses that are sensitive to imputation, such as variance, correlations and tests, can then be re-run on observed values only.
+Every imputation adds `<column>_was_missing` (true/false) unless you turn it off. The change log lists every filled cell, and `audit/imputation_evidence.csv` records what supports each estimate and how reliable it is (`imputation.md`). Analyses that are sensitive to imputation, such as variance, correlations and tests, can then be re-run on observed values only.
 
 ## 5. Check the effect
 

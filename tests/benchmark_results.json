@@ -1,0 +1,38 @@
+{
+  "python": "3.14.6",
+  "platform": "win32",
+  "results": [
+    {
+      "rows": 10100,
+      "seconds": {
+        "profile_and_plan": 12.74,
+        "clean": 8.27,
+        "validate_with_revert_and_replay": 9.0,
+        "eda_with_charts": 4.65,
+        "reports": 4.96
+      },
+      "total_seconds": 39.61,
+      "peak_memory_mb": 294.4,
+      "input_mb": 0.64,
+      "audit_mb": 0.88,
+      "html_report_mb": 1.78,
+      "validation": "PASSED"
+    },
+    {
+      "rows": 101000,
+      "seconds": {
+        "profile_and_plan": 119.55,
+        "clean": 79.7,
+        "validate_with_revert_and_replay": 126.44,
+        "eda_with_charts": 9.22,
+        "reports": 24.16
+      },
+      "total_seconds": 359.09,
+      "peak_memory_mb": 868.3,
+      "input_mb": 6.49,
+      "audit_mb": 8.62,
+      "html_report_mb": 2.54,
+      "validation": "PASSED"
+    }
+  ]
+}

@@ -12,22 +12,86 @@ import os
 import numpy as np
 import pandas as pd
 
-from .common import (ROW_ID, DataMedicError, canon_frame, canon_series, mask_value, now_iso, optional,
-                     parse_bool, parse_date, parse_number, write_json)
+from .common import (ROW_ID, DataMedicError, canon_frame, canon_series, canon_value, mask_value, now_iso, optional,
+                     parse_bool, parse_date, parse_number, read_json, repair_mojibake, write_excel_safe, write_json)
 
 STAGE = {
     "rename_columns": "structure", "drop_rows": "structure", "trim_whitespace": "standardise text",
-    "standardize_missing": "missing values", "convert_type": "data types", "standardize_categories": "standardise text",
-    "replace_values": "corrections", "set_missing_where": "invalid values", "drop_columns": "structure",
-    "drop_duplicates": "duplicates", "impute": "missing values", "winsorize": "outliers", "flag_rows": "review flags",
+    "fix_encoding": "standardise text", "standardize_missing": "missing values", "convert_type": "data types",
+    "standardize_categories": "standardise text", "replace_values": "corrections", "set_missing_where": "invalid values",
+    "drop_duplicates": "duplicates", "drop_columns": "structure", "apply_rule": "domain rules",
+    "quarantine_rows": "row decisions", "impute": "missing values", "winsorize": "outliers", "flag_rows": "review flags",
 }
-OP_ORDER = ["rename_columns", "drop_rows", "trim_whitespace", "standardize_missing", "convert_type",
-            "standardize_categories", "replace_values", "set_missing_where", "drop_columns", "drop_duplicates",
-            "impute", "winsorize", "flag_rows"]
+# Fixed stage order. Each stage needs the ones before it: placeholders are normalised before empty-row and type
+# checks; types before numeric rules; duplicates are judged on every recorded column, before any column is dropped
+# and before rules or imputation fill values; quarantined rows are set aside before imputation statistics are fitted.
+OP_ORDER = ["rename_columns", "drop_rows", "trim_whitespace", "fix_encoding", "standardize_missing", "convert_type",
+            "standardize_categories", "replace_values", "set_missing_where", "drop_duplicates", "drop_columns",
+            "apply_rule", "quarantine_rows", "impute", "winsorize", "flag_rows"]
+RISK_RANK = {"safe": 0, "moderate": 1, "high": 2}
+DEFAULT_RISK = {
+    "rename_columns": "safe", "trim_whitespace": "safe", "standardize_missing": "safe",
+    "standardize_categories": "safe", "flag_rows": "safe", "fix_encoding": "moderate", "convert_type": "moderate",
+    "replace_values": "moderate", "set_missing_where": "moderate", "drop_duplicates": "moderate", "impute": "moderate",
+    "apply_rule": "moderate", "drop_rows": "high", "drop_columns": "high", "quarantine_rows": "high", "winsorize": "high",
+}
+# methods whose filled value can depend on observations later in time
+FUTURE_METHODS = {"interpolate", "bfill"}
+
+
+def op_risk(op):
+    """Risk level of a plan operation: the plan's own value, else a default by operation type."""
+    if op.get("risk") in RISK_RANK:
+        return op["risk"]
+    if op["op"] == "drop_rows" and op.get("params", {}).get("empty"):
+        return "safe"
+    return DEFAULT_RISK.get(op["op"], "high")
+
+
+def _as_list(x):
+    return [] if x is None else list(x) if isinstance(x, (list, tuple)) else [x]
 
 
 def _is_missing(s):
     return s.isna() | s.map(lambda v: isinstance(v, str) and v == "")
+
+
+def _run_lengths(miss):
+    """For a missing-value mask in sequence order, the length of the missing run each position belongs to (0 if present)."""
+    m = miss.to_numpy(dtype=bool)
+    run = pd.Series(m.astype(int), index=miss.index).groupby(np.cumsum(~m)).transform("sum")
+    return run.where(m, 0)
+
+
+def condition_mask(df, when):
+    """Rows matching every condition in a rule's `when` list. A missing value only matches 'missing'."""
+    m = pd.Series(True, index=df.index)
+    for c in _as_list(when):
+        col, how, val = c["column"], c.get("op", "eq"), c.get("value")
+        if col not in df.columns:
+            raise DataMedicError(f"rule condition refers to column '{col}', which is not in the data")
+        s = df[col]
+        miss = _is_missing(s)
+        cs = canon_series(s)
+        if how == "missing":
+            hit = miss
+        elif how == "not_missing":
+            hit = ~miss
+        elif how == "eq":
+            hit = cs == canon_value(val)
+        elif how == "ne":
+            hit = ~miss & (cs != canon_value(val))
+        elif how == "in":
+            hit = cs.isin([canon_value(v) for v in val])
+        elif how == "not_in":
+            hit = ~miss & ~cs.isin([canon_value(v) for v in val])
+        elif how in ("lt", "le", "gt", "ge"):
+            x = _num(s)
+            hit = {"lt": x < float(val), "le": x <= float(val), "gt": x > float(val), "ge": x >= float(val)}[how].fillna(False)
+        else:
+            raise DataMedicError(f"unknown condition operator '{how}'")
+        m &= hit
+    return m
 
 
 def _num(s):
@@ -119,13 +183,20 @@ def rule_mask(df, column, rule, today=None):
 
 
 class Engine:
-    def __init__(self, raw, plan, sensitive=()):
+    def __init__(self, raw, plan, sensitive=(), max_risk=None, collect_evidence=True):
         self.raw = raw
         self.df = raw.copy()
         self.plan = plan
         self.seed = plan.get("settings", {}).get("seed", 42)
         self.sensitive = set(sensitive)
+        if max_risk is not None and max_risk not in RISK_RANK:
+            raise DataMedicError(f"unknown risk level '{max_risk}' (use safe, moderate or high)")
+        self.max_risk = max_risk
         self.log, self.changes, self.removed, self.flags = [], [], [], []
+        self.evidence = []          # one record per imputed or rule-filled cell
+        self.collect_evidence = collect_evidence
+        self.rule_cells = {}        # (row id, column) -> (rule id, value) for conflict detection
+        self.applied = set()
         self.removed_columns = {}
         self.added_columns, self.renames = [], {}
         self.schema = {}
@@ -147,31 +218,58 @@ class Engine:
                     self.changes.append((op_id, int(r), c, o, nw))
         return counts
 
-    def _flag(self, op_id, mask, column, reason, classification, value_col=None):
+    def _flag(self, op_id, mask, column, reason, classification, value_col=None, exclude_from=None):
         vc = value_col or column
         rows = self.df.loc[mask]
         vals = canon_series(rows[vc]) if vc in rows.columns else pd.Series("", index=rows.index)
+        excl = ", ".join(_as_list(exclude_from))
         for rid, v in zip(rows[ROW_ID].tolist(), vals.tolist()):
             if vc in self.sensitive:
                 v = mask_value(v)
             self.flags.append({"flag_id": f"FLAG-{len(self.flags) + 1:05d}", "op_id": op_id, ROW_ID: int(rid),
-                               "column": column or "", "value": v, "reason": reason, "classification": classification})
+                               "column": column or "", "value": v, "reason": reason, "classification": classification,
+                               "exclude_from": excl})
         return int(mask.sum())
 
     # ------------------------------------------------------------ run
     def run(self):
         ops = self.plan.get("operations", [])
         order = {k: i for i, k in enumerate(OP_ORDER)}
-        for op in sorted(ops, key=lambda o: (order.get(o["op"], 99), ops.index(o))):
+        ordered = sorted(ops, key=lambda o: (order.get(o["op"], 99), ops.index(o)))
+        pos = {o["op_id"]: i for i, o in enumerate(ordered)}
+        for op in ordered:
+            risk = op_risk(op)
             entry = {"op_id": op["op_id"], "timestamp": now_iso(), "stage": STAGE.get(op["op"], "other"),
                      "op": op["op"], "column": op.get("params", {}).get("column") or
                      ", ".join(op.get("params", {}).get("columns", []) or []),
                      "issue": op.get("issue", ""), "rationale": op.get("rationale", ""),
                      "evidence": op.get("evidence", {}), "params": op.get("params", {}),
-                     "decided_by": op.get("decided_by", "auto"), "needs_review": op.get("needs_review", False)}
+                     "decided_by": op.get("decided_by", "auto"), "needs_review": op.get("needs_review", False),
+                     "risk": risk, "execution_position": pos[op["op_id"]] + 1,
+                     **({"depends_on": op["depends_on"]} if op.get("depends_on") else {})}
             if not op.get("enabled", True):
                 entry.update(status="not applied (disabled in plan)", affected=0, reversible=True,
                              reversal="nothing to undo")
+                self.log.append(entry)
+                continue
+            deps = _as_list(op.get("depends_on"))
+            late = [d for d in deps if pos.get(d, -1) > pos[op["op_id"]]]
+            unknown = [d for d in deps if d not in pos]
+            if late or unknown:
+                why = (f"depends on {', '.join(late)}, which runs later in the stage order" if late
+                       else f"depends on {', '.join(unknown)}, which is not in the plan")
+                entry.update(status="failed", error=why, affected=0, reversible=True, reversal="nothing applied")
+                self.log.append(entry)
+                continue
+            waiting = [d for d in deps if d not in self.applied]
+            if waiting:
+                entry.update(status=f"not applied (depends on {', '.join(waiting)}, which was not applied)", affected=0,
+                             reversible=True, reversal="nothing to undo")
+                self.log.append(entry)
+                continue
+            if self.max_risk and RISK_RANK[risk] > RISK_RANK[self.max_risk]:
+                entry.update(status=f"not applied (risk '{risk}' is above this run's limit '{self.max_risk}')",
+                             affected=0, reversible=True, reversal="nothing to undo")
                 self.log.append(entry)
                 continue
             fn = getattr(self, "op_" + op["op"], None)
@@ -189,6 +287,7 @@ class Engine:
             entry.update(result)
             entry.setdefault("status", "applied" if entry.get("affected") else "applied (no values changed)")
             entry.setdefault("reversible", True)
+            self.applied.add(op["op_id"])
             self.log.append(entry)
         return self
 
@@ -213,10 +312,83 @@ class Engine:
             mask = rule_mask(self.df, (rule or {}).get("column"), rule or {"row_ids": row_ids or []})
         ids = self.df.loc[mask, ROW_ID].astype(int).tolist()
         for r in ids:
-            self.removed.append({"op_id": op_id, ROW_ID: r, "reason": reason, "retained_row_id": ""})
+            self.removed.append({"op_id": op_id, ROW_ID: r, "reason": reason, "retained_row_id": "",
+                                 "dm_disposition": "removed", "dm_differing_columns": ""})
         self.df = self.df.loc[~mask].copy()
-        return {"affected": len(ids), "method": "remove rows to quarantine", "row_count_change": -len(ids),
+        return {"affected": len(ids), "method": "remove rows", "row_count_change": -len(ids),
                 "reversal": "rows are stored with original values in audit/removed_records.csv"}
+
+    def op_quarantine_rows(self, op_id, reason, rule, column=None):
+        """Set rows aside: out of the trusted cleaned data, kept whole in audit/quarantined_records.csv."""
+        mask = rule_mask(self.df, column or rule.get("column"), rule)
+        ids = self.df.loc[mask, ROW_ID].astype(int).tolist()
+        for r in ids:
+            self.removed.append({"op_id": op_id, ROW_ID: r, "reason": reason, "retained_row_id": "",
+                                 "dm_disposition": "quarantined", "dm_differing_columns": ""})
+        self.df = self.df.loc[~mask].copy()
+        return {"affected": len(ids), "method": "quarantine rows (kept outside the cleaned data until resolved)",
+                "row_count_change": -len(ids),
+                "reversal": "rows are stored with original values in audit/quarantined_records.csv"}
+
+    def op_fix_encoding(self, op_id, columns):
+        """Repair text garbled by a wrong encoding (UTF-8 read as Windows-1252/Latin-1), only where the repair is exact."""
+        cols = self._str_cols(columns)
+        before = {c: canon_series(self.df[c]) for c in cols}
+        for c in cols:
+            self.df[c] = self.df[c].map(lambda v: repair_mojibake(v) if isinstance(v, str) else v)
+        counts = self._diff(op_id, cols, before)
+        return {"affected": sum(counts.values()), "details": counts,
+                "method": "re-decode UTF-8 text that was read as Windows-1252 (only exact round trips)",
+                "reversal": "original values in audit/cell_changes.csv"}
+
+    def op_apply_rule(self, op_id, rule_id, when, set, source, only_if_missing=True, description=""):
+        """Set values from a documented business rule. Conflicts with an earlier rule on the same cell fail the step."""
+        if not source:
+            raise DataMedicError(f"{op_id}: rule {rule_id} has no 'source'; a rule needs documented provenance")
+        mask = condition_mask(self.df, when)
+        cols = list(set)
+        missing_cols = [c for c in cols if c not in self.df.columns]
+        if missing_cols:
+            raise DataMedicError(f"{op_id}: rule {rule_id} sets columns not in the data: {missing_cols}")
+        targets = {}
+        conflicts = []
+        for c, v in set.items():
+            t = mask & _is_missing(self.df[c]) if only_if_missing else mask
+            targets[c] = t
+            cv = canon_value(v)
+            for rid in self.df.loc[t, ROW_ID].astype(int):
+                prev = self.rule_cells.get((rid, c))
+                if prev and prev[1] != cv:
+                    conflicts.append(f"row {rid} {c}: {prev[0]} set '{prev[1]}', {rule_id} wants '{cv}'")
+        if conflicts:
+            raise ValueError(f"rule {rule_id} conflicts with an earlier rule on {len(conflicts)} cells; resolve the "
+                             f"rules in the plan (first: {conflicts[0]})")
+        before = {c: canon_series(self.df[c]) for c in cols}
+        for c, v in set.items():
+            t = targets[c]
+            s = self.df[c]
+            if pd.api.types.is_bool_dtype(s) or str(s.dtype) == "boolean":
+                val = parse_bool(str(v))
+            elif pd.api.types.is_numeric_dtype(s):
+                val = float(v)
+            elif pd.api.types.is_datetime64_any_dtype(s):
+                val = pd.Timestamp(v)
+            else:
+                val = str(v)
+            col = s.copy()
+            col[t] = val
+            self.df[c] = col
+            for rid in self.df.loc[t, ROW_ID].astype(int):
+                self.rule_cells[(rid, c)] = (rule_id, canon_value(v))
+                self.evidence.append({"op_id": op_id, ROW_ID: int(rid), "column": c, "method": "domain rule",
+                                      "imputed_value": canon_value(v), "support_n": "", "group": "", "group_n": "",
+                                      "dispersion": "", "gap_length": "", "uses_future_values": False,
+                                      "fallback_used": False, "source": f"{rule_id}: {source}"})
+        counts = self._diff(op_id, cols, before)
+        return {"affected": sum(counts.values()), "details": {"rule_id": rule_id, "rows_matching": int(mask.sum()),
+                                                              "cells_set": counts, "only_if_missing": only_if_missing},
+                "method": f"business rule {rule_id}", "statistical_basis": {"source": source, "description": description},
+                "reversal": "original values in audit/cell_changes.csv"}
 
     def _str_cols(self, columns):
         return [c for c in columns if c in self.df.columns and self.df[c].dtype == object]
@@ -336,36 +508,55 @@ class Engine:
                 "column_count_change": -len(cols),
                 "reversal": "original column values in audit/removed_columns.csv"}
 
-    def op_drop_duplicates(self, op_id, reason, subset=None, keep="first", ignore_case=False):
+    def op_drop_duplicates(self, op_id, reason, subset=None, keep="first", ignore_case=False, order_by=None):
+        """Remove repeated records. `subset` is a business key; rows that share it but differ elsewhere are
+        conflicting duplicates, and which one is kept follows `keep` (first, last, most_complete, latest, earliest)."""
         cols = subset or [c for c in self.df.columns if c != ROW_ID]
+        missing_cols = [c for c in cols if c not in self.df.columns]
+        if missing_cols:
+            raise DataMedicError(f"{op_id}: duplicate key columns not in the data: {missing_cols}")
         key = canon_frame(self.df[cols])
         if ignore_case:
             key = key.apply(lambda s: s.str.casefold())
-        if keep == "most_complete":
-            filled = (canon_frame(self.df.drop(columns=[ROW_ID])) != "").sum(axis=1)
-            order = filled.sort_values(ascending=False, kind="stable").index
-            key_o = key.loc[order]
-            dup_o = key_o.duplicated(keep="first")
-            dup = dup_o.reindex(self.df.index)
+        if keep in ("most_complete", "latest", "earliest"):
+            if keep == "most_complete":
+                filled = (canon_frame(self.df.drop(columns=[ROW_ID])) != "").sum(axis=1)
+                order = filled.sort_values(ascending=False, kind="stable").index
+            else:
+                if not order_by or order_by not in self.df.columns:
+                    raise DataMedicError(f"{op_id}: keep='{keep}' needs order_by (a date or sequence column)")
+                t = self.df[order_by]
+                t = t if pd.api.types.is_datetime64_any_dtype(t) else _num(t)
+                order = t.sort_values(ascending=(keep == "earliest"), kind="stable", na_position="last").index
+            dup = key.loc[order].duplicated(keep="first").reindex(self.df.index)
         else:
             dup = key.duplicated(keep=keep)
         groups = key.astype(str).agg("\x1f".join, axis=1)
         kept = {}
         for idx in self.df.index[~dup]:
-            kept.setdefault(groups[idx], int(self.df.at[idx, ROW_ID]))
-        ids = []
+            kept.setdefault(groups[idx], idx)
+        body = canon_frame(self.df.drop(columns=[ROW_ID]))
+        ids, conflicting = [], 0
         for idx in self.df.index[dup]:
             r = int(self.df.at[idx, ROW_ID])
             ids.append(r)
-            self.removed.append({"op_id": op_id, ROW_ID: r, "reason": reason, "retained_row_id": kept.get(groups[idx], "")})
+            k = kept.get(groups[idx])
+            differ = [c for c in body.columns if k is not None and body.at[idx, c] != body.at[k, c]]
+            conflicting += bool(differ)
+            self.removed.append({"op_id": op_id, ROW_ID: r, "reason": reason,
+                                 "retained_row_id": int(self.df.at[k, ROW_ID]) if k is not None else "",
+                                 "dm_disposition": "removed", "dm_differing_columns": ", ".join(differ)})
         self.df = self.df.loc[~dup].copy()
         return {"affected": len(ids), "method": f"remove duplicates (keep {keep})",
-                "details": {"columns_compared": "all" if subset is None else cols, "ignore_case": ignore_case},
+                "details": {"columns_compared": "all" if subset is None else cols, "ignore_case": ignore_case,
+                            "removed_rows_that_differ_from_the_kept_row": conflicting,
+                            **({"order_by": order_by} if order_by else {})},
                 "row_count_change": -len(ids),
                 "reversal": "removed rows with original values in audit/removed_records.csv"}
 
     def op_impute(self, op_id, column, method, value=None, group_by=None, add_indicator=True, order_by=None,
-                  features=None, fit_on=None, limit=None, n_neighbors=5):
+                  features=None, fit_on=None, limit=None, n_neighbors=5, source=None, mapping=None, match="exact",
+                  max_gap=None, max_gap_duration=None):
         s = self.df[column]
         miss = _is_missing(s)
         n_miss = int(miss.sum())
@@ -379,6 +570,10 @@ class Engine:
         out = s.copy()
         if n_miss == 0:
             return {"affected": 0, "method": method, "status": "applied (no missing values)", "reversal": "nothing to undo"}
+        # per-cell evidence, filled in by each method; index = rows that were missing
+        ev = pd.DataFrame(index=self.df.index[miss], columns=["support_n", "group", "group_n", "dispersion",
+                                                              "gap_length", "fallback_used"], dtype=object)
+        ev["fallback_used"] = False
         if method in ("mean", "median", "mode", "constant"):
             fit = s[fit_rows & ~miss]
             if method == "mean":
@@ -400,10 +595,13 @@ class Engine:
             out = s.copy()
             out[miss] = v
             basis.update(value=v, fitted_on_rows=int((fit_rows & ~miss).sum()))
+            if method != "constant":
+                ev["support_n"] = basis["fitted_on_rows"]
+                ev["dispersion"] = _spread(fit) if numeric else _share(fit, v)
         elif method in ("group_median", "group_mean", "group_mode"):
             if not group_by:
                 raise DataMedicError(f"{op_id}: {method} needs group_by")
-            gcols = group_by if isinstance(group_by, list) else [group_by]
+            gcols = _as_list(group_by)
             fitdf = self.df[fit_rows & ~miss]
             agg = {"group_median": "median", "group_mean": "mean"}.get(method)
             if agg:
@@ -413,6 +611,9 @@ class Engine:
                 table = fitdf.groupby(gcols, dropna=False)[column].agg(lambda x: x.mode().iloc[0] if len(x.mode()) else None)
                 m = fitdf[column].mode()
                 overall = m.iloc[0] if len(m) else None
+            sizes = fitdf.groupby(gcols, dropna=False)[column].count().to_dict()
+            spread = fitdf.groupby(gcols, dropna=False)[column].agg(_spread if numeric else
+                                                                    (lambda x: _share(x, x.mode().iloc[0]) if len(x.mode()) else "")).to_dict()
             keys = self.df[gcols].apply(tuple, axis=1) if len(gcols) > 1 else self.df[gcols[0]]
             lookup = table.to_dict()
             fills = keys.map(lambda k: lookup.get(k, None))
@@ -424,30 +625,83 @@ class Engine:
             out[miss] = fills[miss]
             basis.update(groups=len(lookup), group_values={str(k): v for k, v in list(lookup.items())[:50]},
                          fallback_value=overall, fallback_rows=int(fallback.sum()))
+            k_miss = keys[miss]
+            ev["group"] = k_miss.map(str)
+            ev["group_n"] = k_miss.map(lambda k: sizes.get(k, 0))
+            ev["support_n"] = ev["group_n"]
+            ev["dispersion"] = k_miss.map(lambda k: spread.get(k, ""))
+            ev["fallback_used"] = fallback[miss]
+            ev.loc[ev["fallback_used"].astype(bool), "support_n"] = int(len(fitdf))
         elif method in ("interpolate", "ffill", "bfill"):
             if not order_by:
                 raise DataMedicError(f"{op_id}: {method} needs order_by (a date or sequence column)")
-            order = self.df.sort_values([order_by, ROW_ID], kind="stable").index
-            ordered = _num(s.loc[order]) if method == "interpolate" else s.loc[order]
-            if method == "interpolate":
-                t = self.df.loc[order, order_by]
-                if pd.api.types.is_datetime64_any_dtype(t):
-                    tmp = pd.Series(ordered.values, index=pd.DatetimeIndex(t.values))
-                    filled = tmp.interpolate(method="time", limit_area="inside", limit=limit).values
+            gcols = _as_list(group_by)
+            order = self.df.sort_values(gcols + [order_by, ROW_ID], kind="stable").index
+            res = pd.Series(np.nan, index=self.df.index, dtype="float64" if method == "interpolate" else object)
+            runs = pd.Series(0, index=self.df.index)
+            span = pd.Series(pd.NaT, index=self.df.index, dtype="timedelta64[ns]")
+            dup_ts = 0
+            seqs = (self.df.loc[order].groupby(gcols, sort=False, dropna=False).indices.values() if gcols
+                    else [np.arange(len(order))])
+            for posn in seqs:
+                idx = order[posn]
+                t = self.df.loc[idx, order_by]
+                is_time = pd.api.types.is_datetime64_any_dtype(t)
+                dup_ts += int(t.duplicated().sum())
+                ordered = _num(s.loc[idx]) if method == "interpolate" else s.loc[idx]
+                if method == "interpolate":
+                    if is_time:
+                        tmp = pd.Series(ordered.values, index=pd.DatetimeIndex(t.values))
+                        filled = tmp.interpolate(method="time", limit_area="inside", limit=limit).values
+                    else:
+                        filled = ordered.interpolate(method="linear", limit_area="inside", limit=limit).values
+                    r = pd.Series(filled, index=idx)
+                elif method == "ffill":
+                    r = ordered.ffill(limit=limit)
                 else:
-                    filled = ordered.interpolate(method="linear", limit_area="inside", limit=limit).values
-                res = pd.Series(filled, index=order)
-            elif method == "ffill":
-                res = ordered.ffill(limit=limit)
-            else:
-                res = ordered.bfill(limit=limit)
-            res = res.reindex(self.df.index)
+                    r = ordered.bfill(limit=limit)
+                res.loc[idx] = r.values
+                runs.loc[idx] = _run_lengths(miss.loc[idx]).values
+                if is_time:
+                    obs_t = t.where(~miss.loc[idx])
+                    prev_t, next_t = obs_t.ffill(), obs_t.bfill()
+                    sp = {"interpolate": next_t - prev_t, "ffill": t - prev_t, "bfill": next_t - t}[method]
+                    span.loc[idx] = sp.values
+            withheld = pd.Series(False, index=self.df.index)
+            if max_gap is not None:
+                withheld |= miss & (runs > int(max_gap))
+            if max_gap_duration:
+                withheld |= miss & (span > pd.Timedelta(max_gap_duration)).fillna(False)
+            res[withheld] = np.nan if method == "interpolate" else None
             if str(s.dtype) == "Int64":
-                res = res.round().astype("Int64")
+                res = pd.to_numeric(res, errors="coerce").round().astype("Int64")
             out = s.copy()
             out[miss] = res[miss]
-            basis.update(order_by=order_by, limit=limit, note="no extrapolation beyond the first/last observed value"
-                         if method == "interpolate" else "")
+            basis.update(order_by=order_by, limit=limit, group_by=gcols or None, max_gap=max_gap,
+                         max_gap_duration=max_gap_duration, uses_future_values=method in FUTURE_METHODS,
+                         left_missing_because_gap_too_long=int(withheld.sum()), duplicate_timestamps=dup_ts,
+                         note="no extrapolation beyond the first/last observed value" if method == "interpolate" else "")
+            if dup_ts:
+                basis["warning"] = (f"{dup_ts} repeated values of {order_by} within a series; neighbours at the same "
+                                    "time are ordered by row id, which is arbitrary")
+            ev["gap_length"] = runs[miss]
+            ev["support_n"] = 2 if method == "interpolate" else 1
+            ev["dispersion"] = span[miss].map(lambda d: "" if pd.isna(d) else f"bracketing span {d}")
+            if gcols:
+                gk = self.df[gcols].astype(str).agg(" / ".join, axis=1)
+                ev["group"] = gk[miss]
+        elif method == "lookup":
+            if source not in self.df.columns or not mapping:
+                raise DataMedicError(f"{op_id}: lookup needs an existing 'source' column and a 'mapping'")
+            keys = canon_series(self.df[source])
+            if match == "first_word":
+                keys = keys.str.split().str[0].fillna("")
+            fills = keys.map(lambda k: mapping.get(k))
+            hit = miss & fills.notna()
+            out = s.copy()
+            out[hit] = fills[hit]
+            basis.update(source=source, match=match, filled=int(hit.sum()), left_missing=int((miss & ~hit).sum()))
+            ev["group"] = keys[miss].map(lambda k: f"{source}={k}")
         elif method in ("knn", "iterative"):
             sk = optional("sklearn")
             if sk is None:
@@ -474,6 +728,7 @@ class Engine:
             out[miss] = res[miss]
             basis.update(features=feats, standardised=True, seed=self.seed,
                          **({"n_neighbors": n_neighbors} if method == "knn" else {}))
+            ev["support_n"] = n_neighbors if method == "knn" else int((fit_rows & ~miss).sum())
         else:
             raise DataMedicError(f"{op_id}: unknown imputation method '{method}'")
         self.df[column] = out
@@ -492,6 +747,23 @@ class Engine:
             basis["distribution_after"] = _dist(self.df[column])
         if fit_on:
             basis["fit_on"] = fit_on
+        if source and method != "lookup":
+            basis["source"] = source
+        if self.collect_evidence:
+            filled_now = miss & ~_is_missing(self.df[column])
+            rec = ev.loc[self.df.index[filled_now]].copy()
+            for k in ("support_n", "group", "group_n", "dispersion"):
+                rec[k] = rec[k].astype(object).where(rec[k].notna(), "")
+            rec["gap_length"] = rec["gap_length"].map(lambda g: "" if pd.isna(g) else int(g))
+            rec["fallback_used"] = rec["fallback_used"].astype(bool)
+            rec.insert(0, "imputed_value", canon_series(self.df.loc[filled_now, column]).values)
+            rec.insert(0, "method", method)
+            rec.insert(0, "column", column)
+            rec.insert(0, ROW_ID, self.df.loc[filled_now, ROW_ID].astype(int).values)
+            rec.insert(0, "op_id", op_id)
+            rec["uses_future_values"] = method in FUTURE_METHODS
+            rec["source"] = (source or "") if method != "lookup" else f"mapping on {source}"
+            self.evidence.extend(rec.to_dict("records"))
         still = int(_is_missing(self.df[column]).sum())
         return {"affected": counts.get(column, 0), "method": f"{method} imputation", "statistical_basis": basis,
                 "details": {"missing_before": n_miss, "missing_after": still},
@@ -513,10 +785,14 @@ class Engine:
                 {"lower_bound": lo, "upper_bound": hi, "lower_q": lower_q, "upper_q": upper_q},
                 "reversal": "original values in audit/cell_changes.csv"}
 
-    def op_flag_rows(self, op_id, rule, reason, column=None, classification="for review"):
+    def op_flag_rows(self, op_id, rule, reason, column=None, classification="for review", exclude_from=None):
+        """Flag rows for review. `exclude_from` (column names, or ["all"]) also keeps the rows out of those
+        columns' statistics in EDA without deleting anything (analytical exclusion)."""
         mask = rule_mask(self.df, column, rule)
-        n = self._flag(op_id, mask, column, reason, classification)
-        return {"affected": 0, "flagged": n, "method": "flag for review (values unchanged)",
+        n = self._flag(op_id, mask, column, reason, classification, exclude_from=exclude_from)
+        excl = _as_list(exclude_from)
+        return {"affected": 0, "flagged": n, "method": "flag for review (values unchanged)"
+                + (f"; excluded from analysis of {', '.join(excl)}" if excl else ""),
                 "status": f"flagged {n} rows" if n else "no rows matched", "reversal": "nothing changed"}
 
 
@@ -526,6 +802,18 @@ def _dist(s):
         return {}
     return {"n": int(len(x)), "mean": float(x.mean()), "median": float(x.median()),
             "std": float(x.std(ddof=1)) if len(x) > 1 else 0.0}
+
+
+def _spread(s):
+    x = _num(s).dropna()
+    if len(x) < 2:
+        return "n < 2, spread unknown"
+    return f"IQR {x.quantile(0.75) - x.quantile(0.25):.4g}, sd {x.std(ddof=1):.4g}"
+
+
+def _share(s, v):
+    s = s.dropna()
+    return f"{100 * float((s == v).mean()):.1f}% of observed values are '{v}'" if len(s) else ""
 
 
 # ---------------------------------------------------------------- writing outputs
@@ -556,7 +844,7 @@ def write_outputs(engine, out_dir, raw_meta, excel=True):
     write_json(os.path.join(cd, "schema.json"), schema)
     if excel and optional("openpyxl") is not None and len(cleaned) < 1_048_000:
         try:
-            cleaned.to_excel(os.path.join(cd, "cleaned_dataset.xlsx"), index=False)
+            write_excel_safe({"cleaned_data": cleaned}, os.path.join(cd, "cleaned_dataset.xlsx"))
         except Exception as exc:  # Excel output is optional
             engine.log.append({"op_id": "OUTPUT", "status": f"Excel copy not written: {exc}"})
 
@@ -572,21 +860,37 @@ def write_outputs(engine, out_dir, raw_meta, excel=True):
     _write_csv(os.path.join(ad, "cell_changes.csv"), ch)
 
     raw = engine.raw.set_index(ROW_ID)
-    rem = pd.DataFrame(engine.removed, columns=["op_id", ROW_ID, "reason", "retained_row_id"])
+    rem = pd.DataFrame(engine.removed, columns=REMOVED_META)
     if len(rem):
         orig = raw.loc[rem[ROW_ID].tolist()].reset_index()
         rem = rem.merge(orig, on=ROW_ID, how="left")
     _write_csv(os.path.join(ad, "removed_records.csv"), rem)
+    quar = os.path.join(ad, "quarantined_records.csv")
+    if len(rem) and (rem["dm_disposition"] == "quarantined").any():
+        _write_csv(quar, rem[rem["dm_disposition"] == "quarantined"])
+    elif os.path.exists(quar):
+        os.remove(quar)  # left over from an earlier run of a different plan
     if engine.removed_columns:
         rc = raw[list(engine.removed_columns)].reset_index()
         _write_csv(os.path.join(ad, "removed_columns.csv"), rc)
-    fl = pd.DataFrame(engine.flags, columns=["flag_id", "op_id", ROW_ID, "column", "value", "reason", "classification"])
+    fl = pd.DataFrame(engine.flags, columns=["flag_id", "op_id", ROW_ID, "column", "value", "reason", "classification",
+                                             "exclude_from"])
     _write_csv(os.path.join(ad, "flagged_records.csv"), fl)
+    from .evidence import classify_evidence, row_status
+    comp_path = os.path.join(out_dir, "profiling", "imputation_comparison.json")
+    comparison = read_json(comp_path) if os.path.exists(comp_path) else {}
+    ev = classify_evidence(engine.evidence, comparison, engine.plan.get("settings", {}).get("config"),
+                           {o["op_id"]: o.get("params", {}) for o in engine.plan.get("operations", [])})
+    _write_csv(os.path.join(ad, "imputation_evidence.csv"), ev)
+    _write_csv(os.path.join(ad, "row_status.csv"), row_status(engine.raw[ROW_ID], engine.log, ch, rem, fl))
     write_json(os.path.join(ad, "revert_info.json"), {
         "added_columns": engine.added_columns, "renames": engine.renames,
         "removed_columns": engine.removed_columns, "original_column_order": [c for c in engine.raw.columns],
-        "op_order": [e["op_id"] for e in engine.log]})
+        "op_order": [e["op_id"] for e in engine.log], "max_risk": engine.max_risk})
     return cleaned
+
+
+REMOVED_META = ["op_id", ROW_ID, "reason", "retained_row_id", "dm_disposition", "dm_differing_columns"]
 
 
 # ---------------------------------------------------------------- revert
@@ -628,7 +932,7 @@ def revert(out_dir):
     rem = read_str_csv(os.path.join(ad, "removed_records.csv"))
     if len(rem):
         rem[ROW_ID] = rem[ROW_ID].astype(int)
-        rem = rem.drop(columns=["op_id", "reason", "retained_row_id"])
+        rem = rem.drop(columns=[c for c in REMOVED_META if c != ROW_ID and c in rem.columns])
         rem.index = rem[ROW_ID].tolist()
         df = pd.concat([df, rem[[c for c in rem.columns]]], axis=0)
     cols = info["original_column_order"]
@@ -655,3 +959,68 @@ def frames_equal(a, b):
         return False, {"differing_cells": n, "first": {"row": int(r), "column": a2.columns[c],
                                                        "a": a2.iat[r, c], "b": b2.iat[r, c]}}
     return True, {}
+
+
+# ---------------------------------------------------------------- selective restore
+
+def restore_step(out_dir, op_id):
+    """The cleaned data with one step undone. Returns (table, report); writes nothing.
+
+    Cells the step changed go back to their value before the step. A cell that a later step changed again is
+    still restored, and the report lists it, because the later change is lost. Rows the step removed come back
+    with their original values (no other step is applied to them). An imputation's indicator column is dropped
+    and a dropped column comes back from removed_columns.csv.
+    """
+    from .common import read_json
+    ad = os.path.join(out_dir, "audit")
+    log = read_json(os.path.join(ad, "transformation_log.json"))["operations"]
+    entry = next((e for e in log if e.get("op_id") == op_id), None)
+    if entry is None:
+        raise DataMedicError(f"{op_id} is not in the transformation log")
+    if not str(entry.get("status", "")).startswith(("applied", "flagged")):
+        raise DataMedicError(f"{op_id} was not applied ({entry.get('status')}); there is nothing to restore")
+    df = read_str_csv(os.path.join(out_dir, "cleaned_data", "cleaned_dataset.csv"))
+    df.index = df[ROW_ID].astype(int).tolist()
+    info = read_json(os.path.join(ad, "revert_info.json"))
+    changes = read_str_csv(os.path.join(ad, "cell_changes.csv"))
+    order = {e["op_id"]: i for i, e in enumerate(log)}
+    mine = changes[changes["op_id"] == op_id]
+    later = changes[changes["op_id"].map(order) > order[op_id]]
+    later_keys = set(zip(later[ROW_ID].astype(int), later["column"]))
+    report = {"op_id": op_id, "op": entry.get("op"), "cells_restored": 0, "cells_changed_again_later": 0,
+              "rows_restored": 0, "columns_restored": [], "columns_dropped": [], "notes": []}
+    for row in mine.itertuples(index=False):
+        rid, col = int(getattr(row, ROW_ID)), row.column
+        if col in df.columns and rid in df.index:
+            df.at[rid, col] = row.old_value
+            report["cells_restored"] += 1
+            report["cells_changed_again_later"] += (rid, col) in later_keys
+    if report["cells_changed_again_later"]:
+        report["notes"].append(f"{report['cells_changed_again_later']} restored cells had been changed again by later "
+                               "steps; those later changes are not in this copy")
+    ind = (entry.get("statistical_basis") or {}).get("indicator_column")
+    if ind and ind in df.columns:
+        df = df.drop(columns=[ind])
+        report["columns_dropped"].append(ind)
+    if entry.get("op") == "drop_columns":
+        rc = read_str_csv(os.path.join(ad, "removed_columns.csv"))
+        rc.index = rc[ROW_ID].astype(int).tolist()
+        for c in [c for c, op in info["removed_columns"].items() if op == op_id]:
+            name = info["renames"].get(c, c)
+            df[name] = rc[c].reindex(df.index).fillna("")
+            report["columns_restored"].append(name)
+    if entry.get("op") in ("drop_rows", "drop_duplicates", "quarantine_rows"):
+        rem = read_str_csv(os.path.join(ad, "removed_records.csv"))
+        rem = rem[rem["op_id"] == op_id].drop(columns=[c for c in REMOVED_META if c != ROW_ID and c in rem.columns])
+        rem = rem.rename(columns=info["renames"])
+        rem.index = rem[ROW_ID].astype(int).tolist()
+        for c in df.columns:
+            if c not in rem.columns:
+                rem[c] = ""
+        df = pd.concat([df, rem[list(df.columns)]], axis=0)
+        report["rows_restored"] = int(len(rem))
+        if len(rem):
+            report["notes"].append("restored rows carry their original values; the other cleaning steps were not "
+                                   "applied to them")
+    df = df.sort_values(ROW_ID, key=lambda s: s.astype(int), kind="stable").reset_index(drop=True)
+    return df, report

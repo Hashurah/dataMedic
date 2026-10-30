@@ -14,7 +14,7 @@ import pandas as pd
 from . import charts
 from . import stats as st
 from .clean import read_str_csv
-from .common import ROW_ID, load_config, read_json, write_json
+from .common import ROW_ID, load_config, merged_config, optional, read_json, write_json
 from .profile import name_has
 from .validate import typed_view
 
@@ -29,7 +29,7 @@ def _rel(out_dir, p):
 class EDA:
     def __init__(self, out_dir, target=None, time_col=None, cfg=None, charts_on=True):
         self.out = out_dir
-        self.cfg = cfg or load_config()
+        self.cfg = merged_config(cfg)
         self.ec = self.cfg["eda"]
         self.seed = self.cfg.get("seed", 42)
         self.plan = read_json(os.path.join(out_dir, "plan.json"))
@@ -37,6 +37,7 @@ class EDA:
         self.prof = read_json(os.path.join(out_dir, "profiling", "initial_profile.json"))
         raw = read_str_csv(os.path.join(out_dir, "cleaned_data", "cleaned_dataset.csv"))
         self.df = typed_view(raw, self.schema)
+        self.exclusions = self.apply_exclusions()
         self.n = len(self.df)
         roles = self.plan.get("roles", {})
         cols = self.schema["columns"]
@@ -49,7 +50,6 @@ class EDA:
                          and c not in added and self.df[c].notna().sum() >= 5 and self.df[c].nunique() > 2]
         self.measures.sort(key=lambda c: (not name_has(c, load_config("domain_rules.json")["measure_priority_words"]),
                                           list(cols).index(c)))
-        self.measures = self.measures[: self.ec["max_numeric_columns"]]
         self.categories = []
         for c, i in cols.items():
             if c in ids or c in added or c in self.sensitive or c == self.split:
@@ -64,12 +64,76 @@ class EDA:
         self.time = time_col if time_col in dates else next((d for d in dates if self.df[d].notna().mean() >= 0.8), None)
         self.target = target or next((c for c in roles.get("target_candidate", []) if c in self.df.columns), None)
         self.charts_on = charts_on and charts.available()
+        charts.configure(self.cfg)
         self.chart_count = 0
         self.tests = []
+        self.selection = self.rank_variables()
         self.res = {"rows": self.n, "columns": len(cols), "measures": self.measures, "categories": self.categories,
+                    "variable_selection": self.selection, "analytical_exclusions": self.exclusions,
                     "time_column": self.time, "target": self.target, "identifiers": sorted(ids),
                     "sensitive_columns_excluded_from_value_reports": sorted(self.sensitive),
                     "domain": self.prof.get("domain"), "charts": []}
+
+    # ------------------------------------------------------------ exclusions and variable choice
+    def apply_exclusions(self):
+        """Rows flagged with exclude_from stay in the cleaned data but are left out of the named columns' analysis."""
+        p = os.path.join(self.out, "audit", "flagged_records.csv")
+        if not os.path.exists(p):
+            return []
+        fl = read_str_csv(p)
+        if "exclude_from" not in fl.columns:
+            return []
+        fl = fl[fl["exclude_from"] != ""]
+        out = []
+        for (op, scope), g in fl.groupby(["op_id", "exclude_from"]):
+            hit = self.df[ROW_ID].astype(int).isin(set(g[ROW_ID].astype(int)))
+            cols = [c.strip() for c in scope.split(",")]
+            if "all" in cols:
+                self.df = self.df.loc[~hit]
+            else:
+                for c in cols:
+                    if c in self.df.columns:
+                        self.df.loc[hit, c] = np.nan if self.df[c].dtype.kind in "fiM" else None
+            out.append({"op_id": op, "columns": cols, "rows": int(hit.sum()), "reason": g["reason"].iloc[0]})
+        return out
+
+    def rank_variables(self):
+        """Order measures and grouping columns by how much they can tell, not by their position in the file.
+
+        A measure scores for completeness, spread, a link to the outcome column and a domain priority name;
+        a grouping column scores for completeness and balance (normalised entropy). Charts and the capped
+        analyses follow this order. The scores are recorded so the choice can be checked."""
+        prio = load_config("domain_rules.json")["measure_priority_words"]
+        out = {"measures": [], "categories": []}
+        tgt = self.target
+        for c in self.measures:
+            x = self.df[c]
+            comp = float(x.notna().mean())
+            nun = int(x.nunique())
+            spread = min(1.0, math.log10(max(nun, 1)) / 2)
+            rel = 0.0
+            if tgt and tgt in self.df.columns and tgt != c and st.have_scipy() and self.df[tgt].dtype.kind in "fi":
+                r = st.correlation(x, self.df[tgt])
+                rel = abs(r["spearman_rho"]) if r else 0.0
+            pr = 0.3 if name_has(c, prio) else 0.0
+            score = round(comp * (0.5 + 0.5 * spread) + rel + pr, 4)
+            out["measures"].append({"column": c, "score": score, "completeness": round(comp, 4), "distinct": nun,
+                                    "outcome_link": round(rel, 4), "priority_name": bool(pr)})
+        for c in self.categories:
+            vc = self.df[c].astype("string").value_counts(dropna=True)
+            comp = float(self.df[c].notna().mean())
+            sh = vc / vc.sum() if vc.sum() else vc
+            ent = float(-(sh * np.log(sh)).sum() / math.log(len(sh))) if len(sh) > 1 else 0.0
+            out["categories"].append({"column": c, "score": round(comp * ent, 4), "completeness": round(comp, 4),
+                                      "levels": int(len(vc)), "balance": round(ent, 4)})
+        out["measures"].sort(key=lambda r: -r["score"])
+        out["categories"].sort(key=lambda r: -r["score"])
+        out["measures"] = out["measures"][: self.ec["max_numeric_columns"]]
+        self.measures = [r["column"] for r in out["measures"]]
+        self.categories = [r["column"] for r in out["categories"]]
+        out["note"] = ("measures ranked by completeness, spread, link to the outcome column and domain priority; grouping "
+                       "columns by completeness and balance. Charts and capped analyses follow this order.")
+        return out
 
     # ------------------------------------------------------------ helpers
     def chart(self, kind, fn, *a, **k):
@@ -79,7 +143,8 @@ class EDA:
             p = fn(*a, **k)
             self.chart_count += 1
             rp = _rel(self.out, p)
-            self.res["charts"].append({"kind": kind, "path": rp})
+            self.res["charts"].append({"kind": kind, "path": rp, "library": charts.library(),
+                                       "formats": charts.SETTINGS.get("formats", ["png"])})
             return rp
         except Exception as exc:  # a chart failure must not stop the analysis
             self.res.setdefault("chart_errors", []).append(f"{kind}: {type(exc).__name__}: {exc}")
@@ -103,7 +168,7 @@ class EDA:
             d = st.describe_numeric(self.df[c])
             d["missing"] = int(self.df[c].isna().sum())
             num[c] = d
-            if len(num) <= 6:
+            if len(num) <= self.ec.get("max_distribution_charts", 6):
                 d["chart"] = self.chart("distribution", charts.distribution, self.df[c], c,
                                         self.vpath("distributions", c), self.schema["columns"][c].get("unit", ""))
         cat = {}
@@ -119,7 +184,7 @@ class EDA:
                       "least_frequent": [{"value": str(k), "count": int(v)} for k, v in vc.tail(3).items()],
                       "rare_levels": int(len(rare)), "imbalance_ratio": float(vc.iloc[0] / vc.iloc[-1]) if len(vc) else None,
                       "normalised_entropy": ent}
-            if len(cat) <= 4:
+            if len(cat) <= self.ec.get("max_bar_charts", 4):
                 cat[c]["chart"] = self.chart("bar", charts.bar_counts, vc, c, self.vpath("distributions", c), total)
         self.res["univariate"] = {"numeric": num, "categorical": cat}
 
@@ -214,7 +279,92 @@ class EDA:
                         simpson.append({"a": r["a"], "b": r["b"], "overall_rho": r["spearman_rho"], "group": g,
                                         "within_groups": [{"level": l, "rho": v, "n": n} for l, v, n in within]})
         out["simpsons_paradox_checks"] = simpson
+        out["anomalies"] = self.anomalies()
         self.res["multivariate"] = out
+
+    def anomalies(self):
+        """Rows unusual in several measures at once. Flagged for investigation only; nothing is changed.
+
+        Isolation Forest and a robust (minimum covariance determinant) distance when scikit-learn is installed;
+        otherwise a robust distance on median/MAD-scaled values. An anomaly is not an error: a large order from
+        a large customer is unusual and real."""
+        ac = self.cfg["anomalies"]
+        # distance-based methods need continuous values; on a 1-5 rating almost every value is far from the median
+        ms = [m for m in self.measures if self.df[m].nunique() >= ac["min_distinct"]][: ac["max_features"]]
+        if len(ms) < 2:
+            return {"status": f"not run: needs at least two continuous measures (with {ac['min_distinct']} or more "
+                              "distinct values)"}
+        X = self.df[ms].astype(float)
+        X = X[X.notna().mean(axis=1) >= 0.5]
+        if len(X) < ac["min_rows"]:
+            return {"status": f"not run: {len(X)} usable rows (needs {ac['min_rows']})"}
+        med = X.median()
+        mad = (X - med).abs().median().replace(0, np.nan) * 1.4826
+        Z = ((X - med) / mad).dropna(axis=1, how="all").fillna(0.0)
+        if Z.shape[1] < 2:
+            return {"status": "not run: measures have no spread"}
+        res = {"features": list(Z.columns), "rows_scored": int(len(Z)), "methods": [],
+               "scaling": "median and MAD (robust); missing values set to the median for scoring only"}
+        scores = pd.DataFrame(index=Z.index)
+        sk = optional("sklearn")
+        cut = float(st.scipy_stats.chi2.ppf(ac["robust_distance_quantile"], Z.shape[1])) if st.have_scipy() else None
+        if sk is not None:
+            from sklearn.covariance import MinCovDet
+            from sklearn.ensemble import IsolationForest
+            iso = IsolationForest(random_state=self.seed, contamination=ac["contamination"], n_estimators=200)
+            f_iso = pd.Series(iso.fit_predict(Z.values) == -1, index=Z.index)
+            scores["isolation_forest_score"] = -iso.score_samples(Z.values)
+            res["methods"].append({"method": "Isolation Forest", "flagged": int(f_iso.sum()),
+                                   "contamination": ac["contamination"], "seed": self.seed})
+            flagged = f_iso
+            res["rule"] = "listed when Isolation Forest flags the row"
+            if len(Z) > 5 * Z.shape[1] and cut:
+                try:
+                    d2 = MinCovDet(random_state=self.seed).fit(Z.values).mahalanobis(Z.values)
+                    scores["robust_distance_sq"] = d2
+                    f_d = scores["robust_distance_sq"] > cut
+                    res["methods"].append({"method": "robust covariance distance (MCD)", "flagged": int(f_d.sum()),
+                                           "cutoff_chi2_quantile": ac["robust_distance_quantile"]})
+                    # both methods must agree, which keeps the list short and less dependent on one model's settings
+                    flagged = f_iso & f_d
+                    res["rule"] = "listed when Isolation Forest and the robust distance both flag the row"
+                except ValueError as exc:
+                    res["methods"].append({"method": "robust covariance distance (MCD)", "status": f"not run: {exc}"})
+        elif cut:
+            scores["robust_distance_sq"] = (Z ** 2).sum(axis=1)
+            flagged = scores["robust_distance_sq"] > cut
+            res["methods"].append({"method": "robust distance on median/MAD-scaled values (no scikit-learn)",
+                                   "flagged": int(flagged.sum()), "cutoff_chi2_quantile": ac["robust_distance_quantile"],
+                                   "note": "ignores correlation between measures; install scikit-learn for Isolation "
+                                           "Forest and a robust covariance distance"})
+            res["rule"] = "listed when the robust distance exceeds the cutoff"
+        else:
+            return {"status": "not run: needs scipy or scikit-learn"}
+        top = scores[flagged].sort_values(scores.columns[0], ascending=False).head(ac["max_rows_listed"])
+        rows = []
+        for idx, r in top.iterrows():
+            z = Z.loc[idx]
+            drivers = z.abs().sort_values(ascending=False).head(3).index
+            rows.append({ROW_ID: int(self.df.at[idx, ROW_ID]), **{k: float(v) for k, v in r.items()},
+                         "main_drivers": ", ".join(f"{c} ({float(z[c]):+.1f} robust sd)" for c in drivers)})
+        if flagged.any() and Z.shape[1] >= 2:
+            U, S_, _ = np.linalg.svd(Z.values - Z.values.mean(axis=0), full_matrices=False)
+            res["chart"] = self.chart("anomalies", charts.anomaly_scatter, U[:, :2] * S_[:2], flagged.to_numpy(),
+                                      self.vpath("relationships", "multivariate_anomalies"),
+                                      f"Rows unusual across {Z.shape[1]} measures (two main components)")
+        res["flagged"] = int(flagged.sum())
+        res["share_pct"] = round(100 * float(flagged.mean()), 2)
+        res["note"] = ("flagged for investigation, not removed: an anomaly can be an error, a rare real event or a "
+                       "different kind of record")
+        p = os.path.join(self.out, "analysis", "multivariate_anomalies.csv")
+        if rows:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            pd.DataFrame(rows).to_csv(p, index=False, encoding="utf-8", lineterminator="\n")
+            res["file"] = "analysis/multivariate_anomalies.csv"
+            res["rows"] = rows[:20]
+        elif os.path.exists(p):
+            os.remove(p)
+        return res
 
     def time_series(self):
         if not self.time:
@@ -229,8 +379,10 @@ class EDA:
             return
         span = (d["_t"].max() - d["_t"].min()).days
         per, label, ma_w, season = ("M", "month", 3, 12) if span > 730 else ("W", "week", 4, 52) if span > 90             else ("D", "day", 7, 7)
-        gaps = d["_t"].sort_values().diff().dropna()
-        regular = bool(len(gaps) and (gaps == gaps.mode().iloc[0]).mean() >= 0.8)
+        # the step is measured between distinct timestamps: many rows on one date is not a zero-length step
+        uniq = d["_t"].drop_duplicates().sort_values()
+        gaps = uniq.diff().dropna()
+        regular = bool(len(gaps) and gaps.mode().iloc[0] > pd.Timedelta(0) and (gaps == gaps.mode().iloc[0]).mean() >= 0.8)
         pidx = d["_t"].dt.to_period(per)
         rng = pd.period_range(pidx.min(), pidx.max(), freq=per)
         partial_first = bool(d["_t"].min() > rng[0].start_time)
@@ -244,7 +396,7 @@ class EDA:
         if regular:
             step = gaps.mode().iloc[0]
             big = gaps[gaps > step]
-            ts_sorted = d["_t"].sort_values()
+            ts_sorted = uniq
             out["native_step"] = str(step)
             out["missing_steps"] = int(sum(round(g / step) - 1 for g in big))
             out["gaps"] = [{"after": str(ts_sorted.iloc[i - 1])[:19], "before": str(ts_sorted.iloc[i])[:19],
@@ -273,7 +425,7 @@ class EDA:
                    "last_period": str(s.index[-1]), "first": float(s.iloc[0]), "last": float(s.iloc[-1]),
                    "max": {"period": str(s.idxmax()), "value": float(s.max())},
                    "min": {"period": str(s.idxmin()), "value": float(s.min())}}
-            if st.have_scipy():
+            if st.have_scipy() and s.std() > 0:
                 tr = st.scipy_stats.spearmanr(np.arange(len(s)), s.values)
                 slope = np.polyfit(np.arange(len(s)), s.values, 1)[0]
                 rec["trend"] = {"spearman_rho": float(tr.statistic), "p_value": float(tr.pvalue),
@@ -359,7 +511,7 @@ class EDA:
                                        for k, v in s.head(10).items()]})
         ent = [c for c in self.ids if name_has(c, ["customer", "client", "user", "account", "member", "patient", "student"])]
         for e in ent[:1]:
-            for m in self.measures[:1]:
+            for m in [m for m in self.measures if name_has(m, ADDITIVE)][:1]:
                 s = self.df.groupby(e)[m].sum().sort_values(ascending=False)
                 if len(s) >= 10 and s.sum() > 0:
                     k = max(1, int(math.ceil(0.1 * len(s))))
@@ -500,4 +652,8 @@ class EDA:
         if man.get("analysis_scope", {}).get("sampled"):
             self.res.setdefault("limitations", []).append("analysis ran on a random sample, not the full file")
         write_json(os.path.join(self.out, "analysis", "eda_results.json"), self.res)
+        write_json(os.path.join(self.out, "visualisations", "chart_index.json"),
+                   {"library": charts.library() if self.charts_on else "none (charts off or matplotlib missing)",
+                    "charts": self.res["charts"],
+                    "note": "each chart's numbers are in analysis/eda_results.json under the section named by its kind"})
         return self.res

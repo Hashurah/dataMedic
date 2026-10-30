@@ -24,6 +24,14 @@ def load_config(name="default.json"):
         return json.load(fh)
 
 
+def merged_config(cfg=None):
+    """The default config with a user's (possibly older, partial) config laid over it, section by section."""
+    base = load_config()
+    for k, v in (cfg or {}).items():
+        base[k] = {**base[k], **v} if isinstance(v, dict) and isinstance(base.get(k), dict) else v
+    return base
+
+
 def require(module, purpose):
     """Import an optional library or raise a readable error."""
     try:
@@ -95,6 +103,49 @@ def write_json(path, data):
 def read_json(path):
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def write_excel_safe(sheets, path):
+    """Write DataFrames to .xlsx with every text cell stored as text.
+
+    openpyxl stores a string that starts with '=' as a formula, so a value like '=HYPERLINK(...)' in the data
+    would run when the workbook is opened. Such cells are rewritten as plain text; the value itself is unchanged.
+    """
+    with pd.ExcelWriter(path, engine="openpyxl") as xw:
+        for name, df in sheets.items():
+            df.to_excel(xw, sheet_name=name[:31], index=False)
+        for name, df in sheets.items():
+            ws = xw.sheets[name[:31]]
+            for j, c in enumerate(df.columns):
+                if df[c].dtype.kind not in "OUT" and str(df[c].dtype) not in ("string", "str"):
+                    continue
+                hits = np.flatnonzero(df[c].map(lambda v: isinstance(v, str) and v.startswith("=")).to_numpy())
+                for i in hits:
+                    cell = ws.cell(row=int(i) + 2, column=j + 1)
+                    cell.value = df[c].iat[int(i)]
+                    cell.data_type = "s"
+    return path
+
+
+MOJIBAKE_RE = re.compile(r"Ã[\x80-\xbf]|Ã.|â€|Â |�")
+
+
+def repair_mojibake(v):
+    """Undo UTF-8 text that was decoded as Windows-1252 or Latin-1 ('cafÃ©' -> 'café').
+
+    Only a value that re-encodes and decodes exactly, and comes out without garbling markers, is changed;
+    anything else (including text that merely contains 'Ã') is returned as it was.
+    """
+    if not isinstance(v, str) or not MOJIBAKE_RE.search(v) or "�" in v:
+        return v
+    for enc in ("cp1252", "latin-1"):
+        try:
+            fixed = v.encode(enc).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        if fixed != v and not MOJIBAKE_RE.search(fixed):
+            return fixed
+    return v
 
 
 # ---------------------------------------------------------------- canonical strings

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Install dataMedic's Python libraries into a private environment inside the skill folder.
 
-    python setup.py              required and optional libraries (see requirements.txt)
+    python setup.py              required and recommended libraries (see requirements.txt)
     python setup.py --minimal    only what the core needs: pandas, numpy, scipy, matplotlib
+    python setup.py --extra      also plotly (interactive report charts) and rich (terminal tables)
     python setup.py --check      report what is installed, change nothing
 
 The environment lives in .venv/ next to this file (ignored by git). scripts/dm.py uses it
@@ -18,9 +19,11 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 VENV = os.path.join(HERE, ".venv")
 REQUIREMENTS = os.path.join(HERE, "requirements.txt")
+EXTRA = os.path.join(HERE, "requirements-extra.txt")
 CORE = ["pandas>=2.0", "numpy>=1.24", "scipy>=1.10", "matplotlib>=3.7"]
 MODULES = [("pandas", True), ("numpy", True), ("scipy", True), ("matplotlib", True),
-           ("openpyxl", False), ("pyarrow", False), ("sklearn", False)]
+           ("openpyxl", False), ("pyarrow", False), ("sklearn", False), ("seaborn", False), ("plotly", False),
+           ("rich", False)]
 
 
 def venv_python():
@@ -59,6 +62,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--minimal", action="store_true", help="install only pandas, numpy, scipy and matplotlib")
     ap.add_argument("--check", action="store_true", help="show what is installed and exit")
+    ap.add_argument("--extra", action="store_true", help="also install plotly and rich (requirements-extra.txt)")
     a = ap.parse_args()
 
     if sys.version_info < (3, 9):
@@ -80,7 +84,7 @@ def main():
                   "sudo apt install python3-venv")
             return 1
     subprocess.run([py, "-m", "pip", "install", "--upgrade", "--quiet", "pip"])
-    args = CORE if a.minimal else ["-r", REQUIREMENTS]
+    args = CORE if a.minimal else ["-r", REQUIREMENTS] + (["-r", EXTRA] if a.extra else [])
     print("Installing " + ("core libraries" if a.minimal else "libraries from requirements.txt") + " ...")
     res = subprocess.run([py, "-m", "pip", "install", "--quiet", *args])
     if res.returncode != 0:

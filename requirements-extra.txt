@@ -1,0 +1,3 @@
+# Installed only by `python setup.py --extra`. Neither is needed for any result.
+plotly>=5.0        # interactive charts in the HTML report (dm report OUT --interactive); adds about 4 MB per report
+rich>=13           # tables and colour in an interactive terminal; plain text otherwise

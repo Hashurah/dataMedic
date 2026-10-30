@@ -1,3 +1,4 @@
+# Installed by `python setup.py`. `--minimal` installs only the first four.
 # Required
 pandas>=2.0
 numpy>=1.24
@@ -5,9 +6,10 @@ numpy>=1.24
 scipy>=1.10
 # Charts
 matplotlib>=3.7
-# Optional
+# Optional; each feature degrades gracefully without its library (see references/visualisation.md and dm check)
 openpyxl>=3.1      # Excel input and Excel copies of outputs
 pyarrow>=12        # Parquet and Feather input
-scikit-learn>=1.3  # KNN and iterative imputation
+scikit-learn>=1.3  # KNN and iterative imputation, Isolation Forest and robust covariance for anomalies
+seaborn>=0.12      # statistical charts (histogram with density, violin, heatmap); matplotlib alone otherwise
 # Tests
 pytest>=7

@@ -2,10 +2,10 @@
 name: data-medic
 description: Autonomous data analyst for raw datasets (CSV, TSV, Excel, JSON, JSON Lines, Parquet, Feather, XML, SQLite, SQL dumps). Profiles the data before touching it, diagnoses quality problems, cleans only what is statistically defensible, validates every change independently, runs exploratory analysis with assumption-checked statistical tests, and writes plain, human-sounding reports backed by an exact, reversible audit trail. Use it whenever the user wants to analyse, clean, explore, profile, investigate or prepare a dataset or spreadsheet, find data-quality problems, missing values, duplicates or outliers, do EDA, find trends, patterns or anomalies, or asks what a dataset reveals, even if they never say "clean" or "EDA". Also use it for /data-medic or when the user mentions dataMedic.
 license: MIT
-compatibility: Needs Python 3.9+ with pandas and numpy; scipy for statistical tests; matplotlib for charts. openpyxl (Excel), pyarrow (Parquet/Feather) and scikit-learn (KNN/iterative imputation) are optional. Runs locally; no data leaves the machine.
+compatibility: Needs Python 3.9+ with pandas and numpy; scipy for statistical tests; matplotlib for charts. openpyxl (Excel), pyarrow (Parquet/Feather), scikit-learn (KNN/iterative imputation, Isolation Forest), seaborn (statistical charts), plotly (interactive report charts) and rich (terminal tables) are optional, and every feature degrades gracefully without them. Runs locally; no data leaves the machine.
 metadata:
   display-name: dataMedic
-  version: "1.0.0"
+  version: "2.0.0"
 ---
 
 # dataMedic: understand, clean, prove, explain
@@ -19,12 +19,13 @@ The value is in that split. A script that calls `dropna()` and draws charts is e
 1. **Understand before modifying.** Profile first. Nothing is changed until there is a plan with a reason for every operation.
 2. **The original is never modified.** Work from the output folder; the input file is hashed and checked.
 3. **Unusual is not wrong.** Outliers are flagged, not deleted. Only demonstrably impossible values (negative ages, latitude 95) are set to missing, and the original stays in the change log.
-4. **Nothing disappears silently.** Removed rows and columns go to `audit/`, every changed cell is in `audit/cell_changes.csv`, and `revert` rebuilds the original exactly.
-5. **Technical autonomy, not business authority.** Make safe, reversible decisions yourself. When the right answer depends on what the data means (ambiguous dates, two currencies, "Unknown" as an answer, which of two conflicting records is right), keep the data as it is, flag it, and say so.
-6. **Every number is computed.** No figure in a report may come from memory or estimation. `review` rejects numbers it cannot trace.
-7. **Facts, observations, assumptions and interpretations are labelled as such.** Association is never presented as causation.
-8. **Write like a person.** All narrative output follows `references/writing-style.md` (adapted from the Humanizer skill).
-9. **Data stays local.** Never send the user's data to an external service unless they explicitly ask.
+4. **Nothing disappears silently.** Removed and quarantined rows and removed columns go to `audit/`, every changed cell is in `audit/cell_changes.csv`, every imputed cell has an evidence record, `revert` rebuilds the original exactly, and `restore` undoes any single step.
+5. **Prefer the lightest row decision.** Retain, correct, impute, flag, exclude from one analysis, quarantine, and only then remove (`references/row-decisions.md`). A row with one bad cell is still a record.
+6. **Technical autonomy, not business authority.** Make safe, reversible decisions yourself. When the right answer depends on what the data means (ambiguous dates, two currencies, "Unknown" as an answer, which of two conflicting records is right), keep the data as it is, flag it, and say so.
+7. **Every number is computed.** No figure in a report may come from memory or estimation. `review` rejects numbers it cannot trace.
+8. **Facts, observations, assumptions and interpretations are labelled as such.** Association is never presented as causation.
+9. **Write like a person.** All narrative output follows `references/writing-style.md` (adapted from the Humanizer skill).
+10. **Data stays local.** Never send the user's data to an external service unless they explicitly ask.
 
 ## Setup
 
@@ -32,9 +33,20 @@ Run `python <skill-dir>/scripts/dm.py check` (or `python3`, or `py -3` on Window
 
 `dm.py` finds its libraries by itself. It uses the Python named in the `DATAMEDIC_PYTHON` environment variable if set, otherwise the skill's own `.venv` if one exists, otherwise the Python you launched it with. You never need to activate anything.
 
-If `check` says pandas and numpy are missing, tell the user and ask before installing. The usual answer is `python <skill-dir>/setup.py`, which installs `requirements.txt` into a private `.venv` inside the skill folder and changes nothing else on the machine. `--minimal` installs only the core libraries. If the user already has an environment with the libraries, set `DATAMEDIC_PYTHON` to its Python instead.
+If `check` says pandas and numpy are missing, tell the user and ask before installing. The usual answer is `python <skill-dir>/setup.py`, which installs `requirements.txt` into a private `.venv` inside the skill folder and changes nothing else on the machine.
 
-Without scipy, the pipeline still cleans and validates, but statistical tests are skipped and reported as not run. Without matplotlib, there are no charts.
+- `--minimal` installs only the core libraries.
+- `--extra` adds plotly and rich.
+- If the user already has an environment with the libraries, set `DATAMEDIC_PYTHON` to its Python instead.
+
+Without some libraries, parts of the pipeline fall back:
+
+- scipy: the pipeline still cleans and validates; statistical tests are skipped and reported as not run.
+- matplotlib: no charts.
+- scikit-learn: no KNN or iterative imputation, and a simpler anomaly check.
+- seaborn: charts are drawn with matplotlib alone.
+
+`dm check` lists each library and what changes without it.
 
 ## The workflow
 
@@ -63,7 +75,9 @@ The default output folder is `./datamedic_output/<file name>/`. This writes:
 
 - `profiling/initial_profile.json`: per-column type, role (identifier, measure, category, time, text, target candidate, split, geo, sensitive), counts, missing, unique, min, max, mean, median, mode, std, quartiles, skew, top values, placeholders found, and a domain inference.
 - `profiling/issues.json`: every detected issue with severity, count, evidence and planned action. Missing values include a missingness-mechanism assessment (each column's missingness is tested against every other column).
-- `plan.json`: the proposed cleaning operations. Nothing has changed yet.
+- `profiling/missingness.json`: missing patterns, columns missing together, structural candidates, missingness over time, Little's MCAR test, and a pattern chart. Read its caveat: no test can show values are MNAR.
+- `profiling/imputation_comparison.json`: each candidate imputation method scored on hidden known values (`references/imputation.md`).
+- `plan.json`: the proposed cleaning operations, each with a `risk` (safe, moderate, high). Nothing has changed yet.
 
 Then **review the plan yourself**. This is where your judgement goes:
 
@@ -73,8 +87,22 @@ Then **review the plan yourself**. This is where your judgement goes:
    - from what the user told you,
    - or by leaving it disabled and reporting it as an open decision.
    To enable one, set `"enabled": true`, set `"decided_by": "agent"`, and add your reason to `"rationale"`. If the decision is a business decision (which currency, which day/month order the source system uses, which conflicting record is correct) and nothing in the data or the conversation settles it, leave it disabled and ask the user in your final message.
-3. Sanity-check enabled operations. Do imputation choices make sense for this domain (a missing discount is probably zero, not the median)? Should a flagged rule be stricter or looser? You may change parameters, add operations or add `constraints` (rules validation will enforce). The operation catalogue is in `references/plan-operations.md`.
-4. Consult references only as needed: `missing-data-methodology.md` for imputation choices, `outlier-detection.md` before excluding or winsorising anything, `domain-adaptation.md` for domain rules, `analytical-safety.md` whenever data feeds a model or groups are compared.
+3. Sanity-check enabled operations.
+   - Do imputation choices make sense for this domain? A missing discount is probably zero, not the median.
+   - Each imputation step carries `evidence.strategy_comparison`: the methods tried on hidden known values, the chosen one and the rejected ones. A switch away from the first proposal is explained in the rationale. Check that the winner makes sense: a model-based fill that beats interpolation on a time series is fine for describing the past, but not for forecasting.
+   - Should a flagged rule be stricter or looser?
+   - You may change parameters, add operations or add `constraints` (rules validation will enforce).
+   - Row decisions beyond flags are yours: `quarantine_rows` for records that cannot be trusted yet, and `flag_rows` with `exclude_from` to keep a row but leave it out of one statistic.
+   - Business rules the user states go in as `apply_rule` with a `source` (`references/data-contracts.md`).
+
+   The operation catalogue, the stage order, `depends_on` and the risk levels are in `references/plan-operations.md`.
+4. If the user has expectations the cleaned data must meet, write them as a contract in `OUT/contract.json` with each rule's provenance (`references/data-contracts.md`).
+5. Consult references only as needed:
+   - `missing-data-methodology.md` and `imputation.md` for imputation choices;
+   - `time-series.md` before filling gaps in a series;
+   - `outlier-detection.md` before excluding or winsorising anything;
+   - `domain-adaptation.md` for domain rules;
+   - `analytical-safety.md` whenever data feeds a model or groups are compared.
 
 ### 6–7. Clean and audit
 
@@ -82,7 +110,21 @@ Then **review the plan yourself**. This is where your judgement goes:
 dm clean OUT
 ```
 
-Applies `OUT/plan.json` in a fixed order (structure, whitespace, placeholders, types, labels, corrections, invalid values, column drops, duplicates, imputation, winsorising, flags). It writes `cleaned_data/` (CSV, Excel copy, `schema.json`) and the audit trail in `audit/` (format in `references/audit-trail.md`). If an operation fails, the run continues and the failure is logged. Fix the plan and run `clean` again; it is safe to repeat.
+Applies `OUT/plan.json` in a fixed, dependency-justified order: structure, whitespace, encoding, placeholders, types, labels, corrections, invalid values, duplicates (on every recorded column), column drops, business rules, quarantine, imputation, winsorising, flags.
+
+It writes:
+
+- `cleaned_data/`: CSV, an Excel copy and `schema.json`;
+- the audit trail in `audit/`, including `imputation_evidence.csv` and `row_status.csv` (format in `references/audit-trail.md`).
+
+If an operation fails, the run continues and the failure is logged. Fix the plan and run `clean` again; it is safe to repeat.
+
+Modes:
+
+- `dm clean OUT --safe-only` applies only steps that cannot lose information.
+- `--max-risk moderate` stops before high-risk steps (row and column removal, quarantine, winsorising).
+
+Use them for a conservative first pass, or when the user asks for autonomy without approving destructive steps. Held-back steps are logged and reported.
 
 ### 8. Validate
 
@@ -102,7 +144,10 @@ Validation reloads everything from disk and checks it independently. It covers:
 - plan constraints;
 - imputation sanity, including variance shrinkage;
 - **revert rebuilds the original exactly**;
-- **replaying the plan reproduces the cleaned file byte for byte**.
+- **replaying the plan reproduces the cleaned file byte for byte**;
+- a data contract, if `OUT/contract.json` exists or `--contract FILE` is given: each rule checked before and after cleaning, with conflicting rules reported, not resolved.
+
+It also records quality by dimension (completeness, uniqueness, validity, consistency, integrity, and accuracy, which stays "unverified" without an external reference). There is no single score.
 
 If the status is FAILED: read the failing check, find the cause in the plan or the data, fix it, then run `clean` and `validate` again. Never describe data as validated while a critical check fails. Report unresolved failures plainly.
 
@@ -122,7 +167,11 @@ It also runs:
 - concentration analysis;
 - leakage checks against a target.
 
-Output: `analysis/eda_results.json`, charts in `visualisations/`, and ranked `finding_candidates`.
+Variables are chosen by how informative they are (completeness, spread, link to the outcome, domain priority), not by column position. The ranking is recorded under `variable_selection`.
+
+Rows flagged with `exclude_from` are left out of those columns' statistics, and this is reported. Rows unusual across several continuous measures are listed in `analysis/multivariate_anomalies.csv`: flagged, never changed.
+
+Output: `analysis/eda_results.json`, charts in `visualisations/` (matplotlib, with seaborn for statistical charts when installed; index in `visualisations/chart_index.json`), and ranked `finding_candidates`.
 
 The candidates are leads, not conclusions. Investigate the strongest ones further where the domain calls for it (see `references/domain-adaptation.md`): margins in sales data, conversion by channel in marketing data, clinically meaningful ranges in health data (without inventing medical interpretations). Do your own pandas analysis on `cleaned_data/cleaned_dataset.csv`, and save the numbers you will cite as JSON under `analysis/`. Do not run sophisticated methods for show; five well-supported findings beat twenty weak ones.
 
@@ -132,7 +181,12 @@ The candidates are leads, not conclusions. Investigate the strongest ones furthe
 dm report OUT
 ```
 
-This generates `reports/data_quality_report.md`, `reports/exploratory_data_analysis.md`, `reports/data_audit_report.html` (a static, self-contained audit report readable by someone who has never seen the data), `audit/audit_workbook.xlsx` and `reports/summary_facts.json`.
+This generates:
+
+- `reports/data_quality_report.md` and `reports/exploratory_data_analysis.md`;
+- `reports/data_audit_report.html`: a self-contained, offline, interactive audit report readable by someone who has never seen the data. It has a searchable data preview with imputed and changed cells marked, a record inspector, data lineage, a recovery section, and light and dark themes (`references/visualisation.md`). `--interactive` adds plotly charts when plotly is installed.
+- `audit/audit_workbook.xlsx`;
+- `reports/summary_facts.json`.
 
 Then write the two narrative reports yourself, from `templates/`:
 
@@ -177,6 +231,16 @@ Reports: <links to executive_summary.md, insights_and_recommendations.md, data_a
 
 If any critical step failed, say so first and do not call the work complete.
 
+## Other commands
+
+| Command | Use |
+|---|---|
+| `dm compare OUT COLUMN [--group-by G ...] [--time DATE]` | rerun the masked-value comparison of imputation methods for one column after editing the plan |
+| `dm restore OUT --op OP-ID` | write a copy of the cleaned data with one step undone (`restored/`); the cleaned data is untouched |
+| `dm revert OUT [--to FILE]` | rebuild the whole original table and check it matches |
+| `dm audit OUT` | print the transformation log |
+| `dm relate PARENT:KEY CHILD:KEY` | key uniqueness and referential integrity between two tables |
+
 ## Quick path
 
 `dm run FILE` runs profile, clean, validate, eda and report with the plan exactly as proposed. Use it only for a first look or a re-run, never in place of reviewing the plan when decisions are pending. The narrative reports and `review` are still yours to do.
@@ -187,9 +251,16 @@ Read only what the current step needs:
 
 | File | Read when |
 |---|---|
-| `references/plan-operations.md` | editing `plan.json`: every operation, its parameters, and the order they run in |
-| `references/missing-data-methodology.md` | deciding how to treat missing values |
-| `references/outlier-detection.md` | deciding what to do with outliers or impossible values |
+| `references/plan-operations.md` | editing `plan.json`: every operation, its parameters, risk levels, dependencies and the order they run in |
+| `references/missing-data-methodology.md` | deciding whether and how to treat missing values; reading the missingness diagnostics |
+| `references/imputation.md` | the masked-value comparison, evidence levels, and when multiple imputation is needed |
+| `references/time-series.md` | filling gaps in a time series; long gaps; future-data leakage |
+| `references/row-decisions.md` | removing, quarantining or excluding rows; duplicates and conflicting duplicates |
+| `references/outlier-detection.md` | deciding what to do with outliers, impossible values or multivariate anomalies |
+| `references/data-contracts.md` | business rules (`apply_rule`), contracts, rule provenance and conflicts, quality dimensions |
+| `references/visualisation.md` | chart libraries, theme and formats; what the HTML report contains |
+| `references/security.md` | sensitive columns, what is masked where, formula injection, sharing outputs |
+| `references/scalability.md` | large files: measured limits, sampling, chunking |
 | `references/data-quality-framework.md` | severity, quality dimensions, writing constraints |
 | `references/domain-adaptation.md` | the dataset belongs to a recognisable domain |
 | `references/eda-methodology.md` | planning additional analysis or charts |

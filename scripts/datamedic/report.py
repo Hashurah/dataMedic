@@ -10,9 +10,9 @@ import os
 
 import pandas as pd
 
-from . import charts
+from . import charts, html_report
 from .clean import read_str_csv
-from .common import ROW_ID, fmt_num, mask_value, optional, read_json, write_json
+from .common import ROW_ID, fmt_num, mask_value, merged_config, optional, read_json, write_excel_safe, write_json
 
 
 def _load(out):
@@ -30,6 +30,12 @@ def _load(out):
     d["cleaned"] = read_str_csv(j("cleaned_data", "cleaned_dataset.csv"))
     d["sensitive"] = set(d["plan"].get("roles", {}).get("sensitive", [])) | \
         {c for c, i in d["schema"]["columns"].items() if i.get("sensitive")}
+    opt = {"missingness": j("profiling", "missingness.json"), "comparison": j("profiling", "imputation_comparison.json")}
+    for k, path in opt.items():
+        d[k] = read_json(path) if os.path.exists(path) else None
+    d["evidence"] = read_str_csv(j("audit", "imputation_evidence.csv")) if os.path.exists(j("audit", "imputation_evidence.csv")) else None
+    d["row_status"] = read_str_csv(j("audit", "row_status.csv")) if os.path.exists(j("audit", "row_status.csv")) else None
+    d["cfg"] = merged_config(d["plan"].get("settings", {}).get("config"))
     return d
 
 
@@ -130,6 +136,18 @@ def quality_md(d):
     dup_flags = [e for e in flagged if "duplicate" in e.get("issue", "")]
     for e in dup_flags:
         L.append(f"{e['op_id']}: flagged {fmt_num(e['flagged'])} rows: {e['issue']}.")
+    rem = d["removed"]
+    if len(rem) and "dm_disposition" in rem.columns and (rem["dm_disposition"] == "quarantined").any():
+        q = rem[rem["dm_disposition"] == "quarantined"]
+        L += ["", "## Quarantined rows", "", f"{fmt_num(len(q))} rows were set aside: they are not in the cleaned data and "
+              "are kept with their original values in `audit/quarantined_records.csv` until the issue is resolved."]
+        L += [f"- {k}: {fmt_num(v)} rows" for k, v in q.groupby("reason").size().items()]
+    ev = d.get("evidence")
+    if ev is not None and len(ev):
+        L += ["", "## Imputation evidence", "", "Each imputed value has a record in `audit/imputation_evidence.csv` "
+              "(method, supporting observations, spread, masked-value check, limitations). Evidence levels:", ""]
+        L.append(_md_table(["Column", "Method", "Evidence level", "Cells"],
+                           ev.groupby(["column", "method", "evidence_level"]).size().reset_index().values.tolist()))
     L += ["", "## Invalid values, outliers and logical checks", ""]
     inv = [e for e in applied if e["op"] == "set_missing_where"]
     for e in inv:
@@ -372,7 +390,12 @@ def _mask_df(df, sensitive):
     return df
 
 
-def audit_html(d, out):
+def audit_html(d, out, interactive=False):
+    """The interactive, self-contained audit report (see html_report.py)."""
+    return html_report.build(d, out, interactive=interactive)
+
+
+def _legacy_audit_html(d, out):
     man, p0, p1, issues, log, val = d["man"], d["p0"], d["p1"], d["issues"], d["log"], d["val"]
     sens = d["sensitive"]
     r = man.get("result", {})
@@ -544,21 +567,22 @@ def audit_workbook(d, out):
     p = os.path.join(out, "audit", "audit_workbook.xlsx")
     sens = d["sensitive"]
     ops = pd.DataFrame([{k: (v if not isinstance(v, (dict, list)) else str(v)) for k, v in e.items()} for e in d["log"]])
-    with pd.ExcelWriter(p) as xw:
-        ops.to_excel(xw, sheet_name="operations", index=False)
-        d["changes"].head(1_000_000).to_excel(xw, sheet_name="cell_changes", index=False)
-        _mask_df(d["removed"], sens).head(1_000_000).to_excel(xw, sheet_name="removed_records", index=False)
-        d["flags"].head(1_000_000).to_excel(xw, sheet_name="flagged_records", index=False)
-        if d["val"]:
-            pd.DataFrame(d["val"]["checks"]).astype(str).to_excel(xw, sheet_name="validation", index=False)
-        pd.DataFrame(d["issues"]).astype(str).to_excel(xw, sheet_name="issues", index=False)
+    sheets = {"operations": ops, "cell_changes": d["changes"].head(1_000_000),
+              "removed_records": _mask_df(d["removed"], sens).head(1_000_000),
+              "flagged_records": d["flags"].head(1_000_000)}
+    if d.get("evidence") is not None:
+        sheets["imputation_evidence"] = d["evidence"].head(1_000_000)
+    if d["val"]:
+        sheets["validation"] = pd.DataFrame(d["val"]["checks"]).astype(str)
+    sheets["issues"] = pd.DataFrame(d["issues"]).astype(str)
+    write_excel_safe(sheets, p)
     return p
 
 
 def summary_facts(d):
     man, p0, p1, val, e = d["man"], d["p0"], d["p1"], d["val"], d["eda"]
     applied, flagged, disabled, failed = _status_counts(d["log"])
-    imputed = sum(x.get("affected", 0) for x in applied if x["op"] == "impute")
+    imputed = sum(x.get("affected", 0) for x in applied if x["op"] in ("impute", "apply_rule"))
     dup = sum(x.get("affected", 0) for x in applied if x["op"] == "drop_duplicates")
     invalid = sum(x.get("affected", 0) for x in applied if x["op"] == "set_missing_where")
     q0 = quality_scores(p0)
@@ -573,11 +597,19 @@ def summary_facts(d):
             "completeness_before_pct": q0["completeness_pct"],
             "completeness_after_pct": quality_scores(p1)["completeness_pct"] if p1 else None,
             "sampled": man.get("analysis_scope", {}).get("sampled"),
+            "rows_quarantined": int((d["removed"].get("dm_disposition", pd.Series(dtype=str)) == "quarantined").sum()),
+            "imputation_evidence_levels": (d["evidence"].groupby("evidence_level").size().to_dict()
+                                           if d.get("evidence") is not None and len(d["evidence"]) else {}),
+            "quality_dimensions": (val or {}).get("quality_dimensions"),
+            "contract_rules_failed": [r["id"] for r in ((val or {}).get("contract") or {}).get("rules", []) if not r["passed"]],
             "top_finding_candidates": [{"id": c["candidate_id"], "title": c["title"]} for c in (e or {}).get("finding_candidates", [])[:8]]}
 
 
-def build_reports(out):
+def build_reports(out, interactive=None):
     d = _load(out)
+    charts.configure(d["cfg"])
+    if interactive is None:
+        interactive = bool(d["cfg"].get("report", {}).get("interactive"))
     rd = os.path.join(out, "reports")
     os.makedirs(rd, exist_ok=True)
     written = []
@@ -588,7 +620,7 @@ def build_reports(out):
         with open(os.path.join(rd, "exploratory_data_analysis.md"), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(eda_md(d))
         written.append("reports/exploratory_data_analysis.md")
-    audit_html(d, out)
+    audit_html(d, out, interactive=interactive)
     written.append("reports/data_audit_report.html")
     wb = audit_workbook(d, out)
     if wb:

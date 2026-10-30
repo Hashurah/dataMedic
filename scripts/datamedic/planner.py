@@ -14,24 +14,30 @@ import numpy as np
 import pandas as pd
 
 from . import stats as st
-from .clean import Engine, _is_missing, _num, rule_mask
-from .common import ROW_ID, canon_frame, canon_series, fmt_num, load_config, norm_label, pct
+from .clean import Engine, _is_missing, _num, op_risk, rule_mask
+from .common import (ROW_ID, canon_frame, canon_series, fmt_num, load_config, merged_config, norm_label, optional, pct,
+                     repair_mojibake)
+from .impute_eval import better_than, candidates_for, compare_methods
+from .missingness import diagnose
 from .profile import name_has, name_tokens
 
 
 class PlanBuilder:
     def __init__(self, raw, profile, meta, cfg=None, rules=None):
         self.raw, self.profile, self.meta = raw, profile, meta
-        self.cfg = cfg or load_config()
+        self.cfg = merged_config(cfg)
         self.rules = rules or load_config("domain_rules.json")
         self.ops, self.issues = [], []
+        self.comparisons = {}
+        self.extras = {}
         self.cols = {p["column"]: p for p in profile["columns_profile"]}
 
     # ------------------------------------------------------------ helpers
-    def op(self, op, params, issue, rationale, enabled=True, needs_review=False, evidence=None):
+    def op(self, op, params, issue, rationale, enabled=True, needs_review=False, evidence=None, risk=None):
         o = {"op_id": f"OP-{len(self.ops) + 1:03d}", "op": op, "params": params, "issue": issue,
              "rationale": rationale, "enabled": enabled, "needs_review": needs_review,
              "evidence": evidence or {}, "decided_by": "auto"}
+        o["risk"] = risk or op_risk(o)
         self.ops.append(o)
         return o
 
@@ -88,9 +94,18 @@ class PlanBuilder:
         for c, p in self.cols.items():
             col = self.nc(c)
             if p["mojibake_values"]:
+                vals = self.raw[c].dropna().astype(str)
+                fixable = vals[vals.map(repair_mojibake) != vals]
                 self.issue("encoding", col, "medium", "values that look garbled by a wrong text encoding "
                            "(for example 'Ã©' for 'é')", p["mojibake_values"], n,
-                           action="flagged; re-export the source as UTF-8 if possible")
+                           action=f"{len(fixable)} repaired exactly; re-export the source as UTF-8 if possible"
+                           if len(fixable) else "flagged; re-export the source as UTF-8 if possible")
+                if len(fixable):
+                    self.op("fix_encoding", {"columns": [col]}, "text garbled by a wrong encoding",
+                            "These values are UTF-8 text that was read as Windows-1252. Re-decoding them gives back the "
+                            "original characters exactly; values that do not round-trip are left alone.",
+                            evidence={"repairable": int(len(fixable)),
+                                      "examples": [{"from": a, "to": repair_mojibake(a)} for a in fixable.unique()[:5]]})
             found = p["missing_tokens_found"]
             if found:
                 self.op("standardize_missing", {"column": col, "tokens": sorted(found)}, "missing-value placeholders",
@@ -149,7 +164,8 @@ class PlanBuilder:
                                      "decimal": p.get("decimal_separator", "."), **({"unit": unit} if unit else {})},
                     "numbers stored as text" + (f" ({', '.join(fmts)})" if fmts else ""),
                     f"{p['parse_shares']['number'] * 100:.1f}% of the non-missing values read as numbers.",
-                    evidence={"non_parsing_examples": p["non_parsing_examples"], "decimal": p.get("decimal_separator")})
+                    evidence={"non_parsing_examples": p["non_parsing_examples"], "decimal": p.get("decimal_separator")},
+                    risk="moderate" if p.get("non_parsing_count") else "safe")
             if p.get("non_parsing_count"):
                 self.issue("type", col, "medium", "values that are not numbers in a numeric column; they will be set "
                            "to missing and flagged", p["non_parsing_count"], n,
@@ -181,7 +197,8 @@ class PlanBuilder:
                 why = "All values have one unambiguous reading." if not ambiguous else \
                     f"{ev.get('day_first_only' if order == 'dmy' else 'month_first_only')} values can only be read " \
                     f"{'day-first' if order == 'dmy' else 'month-first'}, so the {ambiguous} ambiguous values are read the same way."
-                self.op("convert_type", params, "dates stored as text", why, evidence=ev)
+                self.op("convert_type", params, "dates stored as text", why, evidence=ev,
+                        risk="moderate" if p.get("non_parsing_count") or ambiguous else "safe")
                 if p.get("non_parsing_count"):
                     self.issue("dates", col, "medium", "values that are not valid dates; set to missing and flagged",
                                p["non_parsing_count"], n, evidence={"examples": p["non_parsing_examples"]})
@@ -271,7 +288,7 @@ class PlanBuilder:
                 self.issue("empty column", c, "medium", "column has no values", n, n)
             self.op("drop_columns", {"columns": empty_cols, "reason": "column has no values"}, "completely empty columns",
                     "An empty column carries no information. Its original values (all blank) are kept in "
-                    "removed_columns.csv.", evidence={"columns": empty_cols})
+                    "removed_columns.csv.", evidence={"columns": empty_cols}, risk="safe")
         for c in df.columns:
             if c == ROW_ID or c in empty_cols:
                 continue
@@ -545,6 +562,11 @@ class PlanBuilder:
     def missing(self, df, numeric):
         cfgm = self.cfg["missing"]
         n = len(df)
+        # every enabled fix so far (placeholders, types, invalid values, missing-value codes) applied, so the
+        # comparison below measures errors on the values imputation will actually see
+        trial = Engine(self.raw, {"operations": [o for o in self.ops if o["enabled"]], "settings": {}}).run().df
+        self.df2 = trial
+        sklearn = optional("sklearn") is not None
         dates = self.dates
         split = next((c for c in df.columns if self.role_of(c, "split")), None)
         fit_on = None
@@ -562,6 +584,7 @@ class PlanBuilder:
                 if len(diffs) and (diffs == diffs.mode().iloc[0]).mean() >= 0.8:
                     time_col = d
                     break
+        self.time_col = time_col
         for c in [c for c in df.columns if c != ROW_ID]:
             m = _is_missing(df[c])
             k = int(m.sum())
@@ -581,6 +604,8 @@ class PlanBuilder:
             action, params, enabled, review, why = None, None, True, False, ""
             if "identifier" in roles:
                 action = "left missing (identifiers are never imputed)"
+            elif "sensitive" in roles:
+                action = "left missing (personal data such as names or contact details is never invented)"
             elif "target_candidate" in roles:
                 action = "left missing (possible outcome variable; imputing it would invent results)"
             elif "split" in roles:
@@ -612,9 +637,13 @@ class PlanBuilder:
                     why = "Filling this many values would mostly report the fill value, not the data."
                 else:
                     if time_col and c != time_col:
-                        params = {"column": c, "method": "interpolate", "order_by": time_col, "add_indicator": True}
+                        gap = self.cfg["time_series"]["max_gap_steps"]
+                        params = {"column": c, "method": "interpolate", "order_by": time_col, "add_indicator": True,
+                                  "max_gap": gap}
                         why = (f"Rows are evenly spaced in time by '{time_col}', so missing values are interpolated "
-                               "between neighbours (time-weighted, no extrapolation past the ends).")
+                               "between neighbours (time-weighted, no extrapolation past the ends). Runs of more than "
+                               f"{gap} consecutive missing values are left missing: a straight line across a long gap "
+                               "would hide whatever happened there.")
                     elif group:
                         params = {"column": c, "method": f"group_{center}", "group_by": group, "add_indicator": True}
                         why = (f"Missingness is related to '{group}', so a single overall {center} would bias groups; "
@@ -643,10 +672,88 @@ class PlanBuilder:
                 action = "left missing"
             if params and fit_on and params.get("method") not in ("interpolate",):
                 params["fit_on"] = fit_on
+            if params and params.get("method") != "constant" and self.cfg["imputation_comparison"]["enabled"] \
+                    and c in trial.columns:
+                params, why = self.compare(trial, c, params, why, cats, numeric, time_col, fit_on, sklearn, ev,
+                                           discrete=c in numeric and self.discrete(df[c]))
+                if action and "imputation" in action:
+                    action = params["method"] + " imputation" + ("" if enabled else " proposed (disabled)")
+                sc = ev.get("strategy_comparison", {})
+                best = (sc.get("methods") or {}).get(sc.get("chosen"), {})
+                usable = self.cfg["imputation_evidence"]["usable_accuracy"]
+                if sc.get("metric") == "accuracy" and best.get("accuracy") is not None and best["accuracy"] < usable:
+                    # the check shows a fill would be wrong more often than right: do not enable it
+                    why += (f" On hidden known values even the best method was right only {best['accuracy'] * 100:.0f}% "
+                            "of the time, so a fill would mostly record wrong labels. Left missing; an explicit "
+                            "'Missing' category is proposed instead (disabled).")
+                    params = {"column": c, "method": "constant", "value": "Missing", "add_indicator": False}
+                    enabled, review = False, True
+                    action = "left missing (fills tested as unreliable; explicit category proposed)"
             self.issue("missing values", c, sev, f"{k} missing ({share * 100:.1f}%). {mech}.", k, n, evidence=ev,
                        action=action or "")
             if params:
                 self.op("impute", params, "missing values", why, enabled=enabled, needs_review=review, evidence=ev)
+
+    @staticmethod
+    def spec_name(params):
+        g = params.get("group_by")
+        g = ", ".join(g) if isinstance(g, list) else g
+        return f"{params['method']} by {g}" if g and params["method"].startswith("group_") else params["method"]
+
+    def compare(self, df, c, params, why, cats, numeric, time_col, fit_on, sklearn, ev, discrete=False):
+        """Masked-value comparison of plausible methods. Switches only to a clearly better method of a kind that
+        suits the column (never to a continuous estimate on a discrete scale), and records the alternatives."""
+        is_num = c in numeric
+        group = params.get("group_by")
+        specs = candidates_for(df, c, is_num, [g for g in cats if g != c], [x for x in numeric if x in df.columns],
+                               time_col if time_col and time_col != c else None,
+                               group_hint=group if isinstance(group, str) else None, sklearn=sklearn and not discrete)
+        if discrete:
+            specs = [s for s in specs if s["method"] in ("median", "group_median")] + [{"name": "mode", "method": "mode"}]
+        name = self.spec_name(params)
+        if name not in {sp.get("name") for sp in specs}:
+            specs.append({"name": name, **{k: v for k, v in params.items()
+                                           if k in ("method", "group_by", "order_by", "max_gap", "features")}})
+        if is_num and "mean" not in {sp.get("name") for sp in specs}:
+            specs.append({"name": "mean", "method": "mean"})  # the baseline every numeric comparison reports
+        fit_rows = None
+        if fit_on:
+            fit_rows = canon_series(df[fit_on["column"]]).isin([str(v) for v in fit_on["values"]])
+        comp = compare_methods(df, c, specs, self.cfg, self.cfg.get("seed", 42), fit_rows=fit_rows,
+                               group_for_subgroups=group if isinstance(group, str) else (cats[0] if cats else None))
+        self.comparisons[c] = comp
+        if comp.get("status") != "ok":
+            ev["strategy_comparison"] = {"status": comp.get("status")}
+            return params, why
+        key = "nmae" if comp["kind"] == "numeric" else "accuracy"
+        summary = {n: {key: m.get(key), "coverage": m.get("coverage"),
+                       **({"bias": m.get("bias"), "spread_ratio": m.get("spread_ratio")} if key == "nmae" else {})}
+                   for n, m in comp["methods"].items() if m.get("status") == "ok"}
+        alt = None if discrete and comp["kind"] == "numeric" and name == "mode" else better_than(comp, name, self.cfg)
+        chosen = name
+        if alt:
+            spec = comp["methods"][alt]["spec"]
+            new = {"column": c, **{k: v for k, v in spec.items() if k != "name"}, "add_indicator": True}
+            if params.get("fit_on") and new["method"] != "interpolate":
+                new["fit_on"] = params["fit_on"]
+            if new["method"] == "interpolate":
+                new["max_gap"] = self.cfg["time_series"]["max_gap_steps"]
+            cur, best = comp["methods"][name], comp["methods"][alt]
+            why += (f" Masked-value check ({comp['masked_per_repeat']} known values hidden, {comp['repeats']} times): "
+                    + (f"{alt} had normalised MAE {best['nmae']:.3f} against {cur['nmae']:.3f} for {name}"
+                       if key == "nmae" else f"{alt} had accuracy {best['accuracy']:.3f} against "
+                       f"{cur['accuracy']:.3f} for {name}") + f", so {alt} is used instead.")
+            params, chosen = new, alt
+        elif name in summary and summary[name][key] is not None:
+            v = summary[name][key]
+            why += (f" Masked-value check: {name} had {'normalised MAE' if key == 'nmae' else 'accuracy'} {v:.3f}"
+                    + (f"; no other method was clearly better (best: {comp['best']})." if comp["best"] != name
+                       else ", the best of the methods compared."))
+        ev["strategy_comparison"] = {"chosen": chosen, "metric": key, "methods": summary,
+                                     "rejected": [n for n in summary if n != chosen],
+                                     "masked_per_repeat": comp["masked_per_repeat"], "repeats": comp["repeats"],
+                                     "limitations": comp["limitations"]}
+        return params, why
 
     def missing_association(self, df, c, m, cats, numeric, alpha=0.01):
         out = []
@@ -686,6 +793,14 @@ class PlanBuilder:
     def build(self):
         self.stage1()
         self.stage2()
+        diag_df = getattr(self, "df2", None)
+        self.extras["missingness"] = diagnose(
+            diag_df if diag_df is not None else self.df1,
+            time_col=getattr(self, "time_col", None) or (self.dates[0] if self.dates else None))
+        base = diag_df if diag_df is not None else self.df1
+        self.extras["_missing_mask"] = pd.DataFrame({c: _is_missing(base[c]) for c in base.columns if c != ROW_ID})
+        self.extras["imputation_comparison"] = {"columns": self.comparisons,
+                                                "note": "random masking of known values; see each column's limitations"}
         settings = {"seed": self.cfg.get("seed", 42), "config": self.cfg}
         roles = self.profile["roles"]
         constraints = []
@@ -714,7 +829,9 @@ class PlanBuilder:
         }, self.issues
 
 
-def build_plan(raw, profile, meta, cfg=None):
+def build_plan(raw, profile, meta, cfg=None, extras=None):
     pb = PlanBuilder(raw, profile, meta, cfg)
     plan, issues = pb.build()
+    if extras is not None:
+        extras.update(pb.extras)
     return plan, issues

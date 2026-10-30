@@ -44,7 +44,7 @@ def typed_view(cleaned, schema):
     return out
 
 
-def validate(out_dir, replay=True):
+def validate(out_dir, replay=True, contract_path=None):
     man = read_json(os.path.join(out_dir, "metadata", "analysis_manifest.json"))
     plan = read_json(os.path.join(out_dir, "plan.json"))
     ck = Checks()
@@ -143,8 +143,20 @@ def validate(out_dir, replay=True):
         ck.add("removed records equal the original rows", same)
     # 7. duplicates
     body = cleaned.drop(columns=[ROW_ID] + [c for c in info["added_columns"] if c in cleaned.columns])
-    dups = int(body.duplicated().sum())
-    dedup_ran = any(e.get("op") == "drop_duplicates" and str(e.get("status", "")).startswith("applied") for e in log)
+    rc_path = os.path.join(ad, "removed_columns.csv")
+    if info["removed_columns"] and os.path.exists(rc_path):
+        # duplicates are judged on every recorded column, including ones dropped after deduplication
+        rcols = read_str_csv(rc_path).set_index(ROW_ID).rename(columns=renames)
+        body = body.assign(**{c: rcols[c].reindex(cleaned[ROW_ID]).values for c in rcols.columns if c not in body.columns})
+    dd = [e for e in log if e.get("op") == "drop_duplicates" and str(e.get("status", "")).startswith("applied")]
+    dedup_ran = bool(dd)
+    dups = 0
+    for e in dd or [{}]:
+        sub = (e.get("params") or {}).get("subset")
+        key = body[[c for c in sub if c in body.columns]] if sub else body
+        if (e.get("params") or {}).get("ignore_case"):
+            key = key.apply(lambda s: s.str.casefold())
+        dups = max(dups, int(key.duplicated().sum()))
     ck.add("no exact duplicate rows remain" if dedup_ran else "exact duplicate rows (deduplication not run)",
            dups == 0 or not dedup_ran, CRITICAL if dedup_ran else WARNING, detail=f"{dups} duplicates")
     # 8. types parse as declared
@@ -183,13 +195,39 @@ def validate(out_dir, replay=True):
                 continue
             bad = int((pd.to_datetime(tv[b], errors="coerce") < pd.to_datetime(tv[a], errors="coerce")).sum())
             ck.add(f"{b} not before {a}", bad == 0, con.get("severity", WARNING), detail=f"{bad} rows")
+    # 9b. data contract: user or confirmed rules, checked before and after cleaning
+    contract_res = None
+    cpath = contract_path or os.path.join(out_dir, "contract.json")
+    if os.path.exists(cpath):
+        from .contracts import conflicts, evaluate, load_contract
+        contract = load_contract(cpath)
+        before_text = raw.drop(columns=[ROW_ID]).rename(columns=renames)
+        before_tv = typed_view(before_text, schema)
+        after = evaluate(contract, tv, cleaned, base_dir=os.path.dirname(contract["_path"]))
+        before = {r["id"]: r for r in evaluate(contract, before_tv, before_text,
+                                               base_dir=os.path.dirname(contract["_path"]))}
+        for r in after:
+            r["violations_before_cleaning"] = before.get(r["id"], {}).get("violations")
+            ck.add(f"contract {r['id']} ({r['rule']}, {r['provenance']})", r["passed"],
+                   CRITICAL if r["severity"] == "critical" else WARNING, detail=r["detail"])
+        conf = conflicts(contract)
+        for cf in conf:
+            ck.add(f"contract rules {' and '.join(cf['rules'])} are consistent", False, WARNING,
+                   detail=f"{cf['column']}: {cf['problem']} (not resolved automatically; decide which rule holds)")
+        contract_res = {"file": contract["_path"], "rules": after, "conflicts": conf}
     # 10. imputation sanity: no missing left where imputation ran, variance shrinkage warning
     for e in log:
         if e.get("op") == "impute" and str(e.get("status", "")).startswith("applied"):
             c = e["params"]["column"]
             left = e.get("details", {}).get("missing_after", 0)
-            ck.add(f"imputation filled {c}", left == 0 or e["params"].get("method") in ("interpolate", "ffill", "bfill"),
-                   WARNING, detail=f"{left} still missing" + (" (no extrapolation at the ends)" if left else ""))
+            final = int(tv[c].isna().sum()) if c in tv.columns else left
+            method = e["params"].get("method")
+            note = (" (no extrapolation at the ends)" if method in ("interpolate", "ffill", "bfill")
+                    else " (no mapping matched)" if method == "lookup" else "")
+            if left and not final:
+                note = " after this step; a later step filled the rest"
+            ck.add(f"imputation filled {c}", left == 0 or final == 0 or method in ("interpolate", "ffill", "bfill", "lookup"),
+                   WARNING, detail=f"{left} still missing" + (note if left else ""))
             sb = e.get("statistical_basis", {})
             b, a = sb.get("distribution_before", {}), sb.get("distribution_after", {})
             if b.get("std") and a.get("std") is not None:
@@ -210,7 +248,8 @@ def validate(out_dir, replay=True):
         from .pipeline import run_clean
         tmp = tempfile.mkdtemp(prefix="dm_replay_")
         try:
-            run_clean(load_from, os.path.join(out_dir, "plan.json"), tmp, lo, write_reference=False, quiet=True)
+            run_clean(load_from, os.path.join(out_dir, "plan.json"), tmp, lo, write_reference=False, quiet=True,
+                      max_risk=info.get("max_risk"))
             h1 = sha256_file(os.path.join(out_dir, "cleaned_data", "cleaned_dataset.csv"))
             h2 = sha256_file(os.path.join(tmp, "cleaned_data", "cleaned_dataset.csv"))
             ck.add("replaying the plan reproduces the cleaned data", h1 == h2, detail=f"{h1[:12]} vs {h2[:12]}")
@@ -218,12 +257,66 @@ def validate(out_dir, replay=True):
             ck.add("replaying the plan reproduces the cleaned data", False, detail=f"{type(exc).__name__}: {exc}")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+    if os.path.exists(os.path.join(ad, "quarantined_records.csv")):
+        q = read_str_csv(os.path.join(ad, "quarantined_records.csv"))
+        ck.add("quarantined records are kept with their original values", len(q) == int(
+            (removed.get("dm_disposition", pd.Series(dtype=str)) == "quarantined").sum()), detail=f"{len(q)} rows")
     crit = [c for c in ck.items if not c["passed"] and c["severity"] == CRITICAL]
     warn = [c for c in ck.items if not c["passed"] and c["severity"] != CRITICAL]
     status = "FAILED" if crit else "PASSED WITH WARNINGS" if warn else "PASSED"
     review = [o["op_id"] for o in plan["operations"] if o.get("needs_review") and not o.get("enabled")]
     result = {"status": status, "critical_failures": len(crit), "warnings": len(warn), "checks": ck.items,
               "open_review_items": review,
+              "quality_dimensions": quality_dimensions(raw, cleaned, info, ck.items, contract_res, out_dir),
+              **({"contract": contract_res} if contract_res else {}),
               "note": "Disabled operations marked needs_review are decisions still open; they are listed, not failures."}
     write_json(os.path.join(out_dir, "audit", "validation_results.json"), result)
     return result
+
+
+def quality_dimensions(raw, cleaned, info, checks, contract_res, out_dir):
+    """Separate measures per quality dimension, before and after cleaning. There is deliberately no single score:
+    one number would let a serious problem in one dimension hide behind good results in the others."""
+    added = [c for c in info["added_columns"] if c in cleaned.columns]
+    body0 = raw.drop(columns=[ROW_ID])
+    body1 = cleaned.drop(columns=[ROW_ID] + added)
+    cells0, cells1 = body0.size, body1.size
+
+    def blank(df):
+        return int((df.apply(lambda s: s.astype(str).str.strip()) == "").values.sum())
+
+    flags_path = os.path.join(out_dir, "audit", "flagged_records.csv")
+    flags = read_str_csv(flags_path) if os.path.exists(flags_path) else pd.DataFrame()
+    logic = int(flags[flags["classification"] == "logical inconsistency"][ROW_ID].nunique()) if len(flags) else 0
+    validity = [c for c in checks if c["check"].startswith(("contract ", "every value matches")) or
+                c["check"].endswith(("is unique", "has no missing values", "only has allowed values")) or " within [" in c["check"]]
+    integrity = [c for c in checks if c["check"].startswith(("revert", "replaying", "row accounting", "column accounting",
+                                                             "every changed value", "change log", "original file"))]
+    def prof_missing(name, fallback, skip=()):
+        p = os.path.join(out_dir, "profiling", name)
+        if not os.path.exists(p):
+            return fallback
+        return int(sum(c["missing_count"] for c in read_json(p)["columns_profile"] if c["column"] not in skip))
+
+    return {
+        "completeness": {"missing_cells_before": prof_missing("initial_profile.json", blank(body0)),
+                         "cells_before": int(cells0),
+                         "missing_cells_after": prof_missing("final_profile.json", blank(body1), set(added)),
+                         "cells_after": int(cells1),
+                         "note": "missing includes placeholder text such as NULL or N/A; after cleaning excludes the "
+                                 "_was_missing indicator columns"},
+        "uniqueness": {"exact_duplicate_rows_before": int(body0.duplicated().sum()),
+                       "exact_duplicate_rows_after": int(body1.duplicated().sum())},
+        "validity": {"checks": len(validity), "passed": sum(c["passed"] for c in validity),
+                     "contract_rules": len(contract_res["rules"]) if contract_res else 0,
+                     "contract_violations_before": sum((r.get("violations_before_cleaning") or 0)
+                                                       for r in contract_res["rules"]) if contract_res else None,
+                     "contract_violations_after": sum((r.get("violations") or 0) for r in contract_res["rules"])
+                     if contract_res else None},
+        "consistency": {"rows_flagged_logically_inconsistent": logic,
+                        "note": "flagged rows keep their values; each needs a decision"},
+        "integrity": {"checks": len(integrity), "passed": sum(c["passed"] for c in integrity)},
+        "accuracy": {"status": "unverified",
+                     "note": "accuracy needs an external reference (a trusted source or ground truth); passing the "
+                             "checks above shows consistency, not correctness"},
+    }
