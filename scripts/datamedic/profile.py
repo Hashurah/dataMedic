@@ -9,7 +9,7 @@ from .common import (ROW_ID, date_order_evidence, decimal_evidence, load_config,
                      parse_bool, parse_date, parse_number, pct, split_number_text)
 
 CURRENCY_TOKEN = re.compile(r"[$€£¥₦₹₩₽¢]|\b(USD|EUR|GBP|NGN|JPY|CAD|AUD|INR|CHF)\b", re.I)
-DATE_SHAPED = re.compile(r"^\s*\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}(\s|T|$)")
+DATE_SHAPED = re.compile(r"^\s*(\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}|\d{1,2}[ ./-]?[A-Za-z]{3,9}[ ./-]?\d{2,4})(\s|T|$)")
 MOJIBAKE = re.compile(r"Ã[\x80-\xbf]|Ã.|â€|Â |�")
 EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
 PHONE = re.compile(r"^\+?[\d\s().-]{7,20}$")

@@ -258,11 +258,30 @@ def parse_bool(raw):
 
 DATE_FORMATS_DMY = ["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d-%m-%y"]
 DATE_FORMATS_MDY = ["%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y", "%m-%d-%y"]
-DATE_FORMATS_OTHER = ["%Y/%m/%d", "%Y.%m.%d", "%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y", "%b %d, %Y",
-                      "%B %d, %Y", "%d-%b-%Y", "%d-%b-%y", "%Y%m%d", "%b %Y", "%B %Y"]
+DATE_FORMATS_OTHER = ["%Y/%m/%d", "%Y.%m.%d", "%Y%m%d"]
+# Month-name dates are normalised to space-separated parts first (see _month_name_date), so
+# 26-Oct-2022, 26/oct/22, 26oct22 and "Oct 26, 2022" all reach one of these.
+DATE_FORMATS_MONTH_NAME = ["%d %b %Y", "%d %B %Y", "%d %b %y", "%d %B %y", "%b %d %Y", "%B %d %Y",
+                           "%b %d %y", "%B %d %y", "%Y %b %d", "%Y %B %d", "%b %Y", "%B %Y"]
 TIME_SUFFIXES = ["", " %H:%M", " %H:%M:%S", " %I:%M %p", " %I:%M:%S %p", "T%H:%M", "T%H:%M:%S"]
 ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?(Z|[+-]\d{2}:?\d{2})?$")
-_DATEISH = re.compile(r"^\s*(\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}|\d{1,2}[ -][A-Za-z]{3,9}[ -,]+\d{2,4}|[A-Za-z]{3,9}\.? \d{1,2},? \d{4}|\d{8}|[A-Za-z]{3,9} \d{4})")
+_ORD = r"(?:st|nd|rd|th)?"
+_DATEISH = re.compile(r"^\s*(\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}|\d{8}"
+                      r"|\d{1,2}" + _ORD + r"[ ./-]?[A-Za-z]{3,9}\.?[ ./,-]*\d{2,4}"
+                      r"|[A-Za-z]{3,9}\.?[ ./-]*\d{1,2}" + _ORD + r"[ ./,-]*\d{2,4}"
+                      r"|\d{4}[ ./-]?[A-Za-z]{3,9}[ ./-]?\d{1,2})")
+_MONTH_WORD = re.compile(r"[A-Za-z]{3}")
+_DATE_AND_TIME = re.compile(r"^(.*?)((?:[ T]\d{1,2}:\d{2}.*)?)$")
+
+
+def _month_name_date(s):
+    """'26-Oct-2022 14:30' -> '26 Oct 2022 14:30', '26oct22' -> '26 oct 22', '26th Sept' -> '26 Sep'."""
+    date, time = _DATE_AND_TIME.match(s).groups()
+    date = re.sub(r"(?<=\d)(?=[A-Za-z])|(?<=[A-Za-z])(?=\d)", " ", date)
+    date = re.sub(r"[-/.,_]", " ", date)
+    date = re.sub(r"\b(\d{1,2}) (st|nd|rd|th)\b", r"\1", date, flags=re.I)
+    date = re.sub(r"\bsept\b", "Sep", date, flags=re.I)
+    return " ".join(date.split()) + time
 
 
 def _strptime(s, fmt):
@@ -282,13 +301,18 @@ def date_candidates(raw, allow_compact=False):
             return {"iso": pd.Timestamp(s.replace("Z", "+00:00"))}
         except (ValueError, OverflowError):
             return {}
+    if _MONTH_WORD.search(s):
+        groups = (("other", DATE_FORMATS_MONTH_NAME),)
+        s = _month_name_date(s)
+    else:
+        groups = (("dmy", DATE_FORMATS_DMY), ("mdy", DATE_FORMATS_MDY), ("other", DATE_FORMATS_OTHER))
     out = {}
-    for group, fmts in (("dmy", DATE_FORMATS_DMY), ("mdy", DATE_FORMATS_MDY), ("other", DATE_FORMATS_OTHER)):
+    for group, fmts in groups:
         for f in fmts:
             if f == "%Y%m%d" and not allow_compact:
                 continue
             for suf in TIME_SUFFIXES:
-                d = _strptime(s.replace(",", ", ").replace(",  ", ", ") if "," in f else s, f + suf)
+                d = _strptime(s, f + suf)
                 if d is not None:
                     out.setdefault(group, d)
                     break

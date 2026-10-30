@@ -105,3 +105,17 @@ def test_parse_date_respects_order_and_rejects_impossible():
     assert parse_date("03/04/2024", "mdy").month == 3
     assert parse_date("2024-13-45") is None
     assert parse_date("Jan 7, 2024").day == 7
+
+
+@pytest.mark.parametrize("raw", [
+    "26-Oct-2022", "26-oct-22", "26/oct/22", "26/OCT/2022", "26oct22", "26OCT2022", "26.Oct.2022",
+    "26 October 2022", "26-october-22", "26th Oct 2022", "26 Sept 2022", "Oct 26, 2022", "oct-26-22",
+    "October 26 2022", "2022-Oct-26", "2022/oct/26", "26-Oct-2022 14:30"])
+def test_parse_date_reads_month_names_in_any_separator_style(raw):
+    d = parse_date(raw)
+    assert d is not None and (d.year, d.month, d.day) == (2022, 9 if "Sept" in raw else 10, 26)
+
+
+@pytest.mark.parametrize("raw", ["32-Oct-2022", "26-Okt-2022", "26-Oct", "Room 26 Oct2022B", "oct"])
+def test_parse_date_rejects_text_that_only_looks_like_a_month_date(raw):
+    assert parse_date(raw) is None
