@@ -13,14 +13,61 @@
   relate   PARENT:KEY CHILD:KEY     key uniqueness and referential integrity between two tables
   audit    OUT                      print the transformation log
   run      FILE [--out DIR]         profile + clean + validate + eda + report with the proposed plan
+  check                             which Python and libraries dataMedic is using
 
 Exit codes: 0 ok, 1 error, 2 validation failed or review found problems.
+
+The libraries come from the first of: the Python in $DATAMEDIC_PYTHON, the skill's own .venv
+(created by `python setup.py`), or the Python running this script.
 """
 
 import argparse
 import json
 import os
+import subprocess
 import sys
+
+SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _has_libraries():
+    from importlib.util import find_spec
+    return find_spec("numpy") is not None and find_spec("pandas") is not None
+
+
+def _environment_python():
+    """The Python that has dataMedic's libraries, if it is not the current one."""
+    explicit = os.environ.get("DATAMEDIC_PYTHON")
+    if explicit:
+        return explicit
+    venv = os.path.join(SKILL_DIR, ".venv", "Scripts" if os.name == "nt" else "bin",
+                        "python.exe" if os.name == "nt" else "python")
+    return venv if os.path.exists(venv) else None
+
+
+def _reexec_if_needed():
+    """Run under the skill's environment when it exists, so nothing has to be activated."""
+    if os.environ.get("DATAMEDIC_REEXEC"):
+        return
+    target = _environment_python()
+    if target and os.path.normcase(os.path.abspath(target)) != os.path.normcase(os.path.abspath(sys.executable)):
+        env = dict(os.environ, DATAMEDIC_REEXEC="1")
+        try:
+            sys.exit(subprocess.run([target, os.path.abspath(__file__), *sys.argv[1:]], env=env).returncode)
+        except OSError as exc:
+            print(f"dataMedic error: cannot run the Python at {target} ({exc}). Fix DATAMEDIC_PYTHON, or "
+                  f"re-create the environment with: python {os.path.join(SKILL_DIR, 'setup.py')}", file=sys.stderr)
+            sys.exit(1)
+    if not _has_libraries():
+        print("dataMedic error: pandas and numpy are not installed for " + sys.executable + ".\n"
+              "Install them once with:  python " + os.path.join(SKILL_DIR, "setup.py") + "\n"
+              "(this creates a private environment in the skill folder that dm.py then uses automatically),\n"
+              "or set DATAMEDIC_PYTHON to a Python that already has them.", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    _reexec_if_needed()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -204,6 +251,21 @@ def cmd_audit(a):
     return 0
 
 
+def cmd_check(a):
+    from datamedic.pipeline import versions
+    v = versions()
+    print(f"Python: {sys.executable} ({v['python']})")
+    print(f"Environment: {'skill .venv' if os.path.join(SKILL_DIR, '.venv') in sys.executable else 'DATAMEDIC_PYTHON' if os.environ.get('DATAMEDIC_PYTHON') else 'current Python'}")
+    for k in ("pandas", "numpy", "scipy", "matplotlib", "openpyxl", "pyarrow", "sklearn"):
+        print(f"  {k:11} {v[k]}")
+    notes = {"scipy": "statistical tests are skipped", "matplotlib": "no charts", "openpyxl": "no Excel input or copies",
+             "pyarrow": "no Parquet or Feather input", "sklearn": "no KNN or iterative imputation"}
+    for k, why in notes.items():
+        if v[k] == "not installed":
+            print(f"Without {k}: {why}.")
+    return 0
+
+
 def cmd_run(a):
     from datamedic.pipeline import default_out
     out = a.out or default_out(a.file)
@@ -288,6 +350,8 @@ def main(argv=None):
     s = sub.add_parser("audit")
     s.add_argument("out")
     s.set_defaults(fn=cmd_audit)
+    s = sub.add_parser("check")
+    s.set_defaults(fn=cmd_check)
     s = sub.add_parser("run")
     s.add_argument("file")
     s.add_argument("--out")

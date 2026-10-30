@@ -28,9 +28,13 @@ The value is in that split. A script that calls `dropna()` and draws charts is e
 
 ## Setup
 
-Find a Python that has the libraries: try `python3`, `python` or `py -3` with `scripts/dm.py --help`. Below, `dm` means `python <skill-dir>/scripts/dm.py`.
+Run `python <skill-dir>/scripts/dm.py check` (or `python3`, or `py -3` on Windows). Below, `dm` means `python <skill-dir>/scripts/dm.py`.
 
-If pandas, numpy or scipy are missing, tell the user which packages are needed (`requirements.txt`) and ask before installing them, preferably into a virtual environment. Without scipy the pipeline still cleans and validates, but statistical tests are skipped and reported as not run. Without matplotlib there are no charts.
+`dm.py` finds its libraries by itself. It uses the Python named in the `DATAMEDIC_PYTHON` environment variable if set, otherwise the skill's own `.venv` if one exists, otherwise the Python you launched it with. You never need to activate anything.
+
+If `check` says pandas and numpy are missing, tell the user and ask before installing. The usual answer is `python <skill-dir>/setup.py`, which installs `requirements.txt` into a private `.venv` inside the skill folder and changes nothing else on the machine. `--minimal` installs only the core libraries. If the user already has an environment with the libraries, set `DATAMEDIC_PYTHON` to its Python instead.
+
+Without scipy, the pipeline still cleans and validates, but statistical tests are skipped and reported as not run. Without matplotlib, there are no charts.
 
 ## The workflow
 

@@ -37,12 +37,30 @@ Most "clean my data" scripts call `dropna()`, fill gaps with the mean and delete
 
 ## Install
 
+Two commands: get the skill, then install its Python libraries.
+
 ```sh
 git clone https://github.com/Hashurah/dataMedic.git ~/.claude/skills/data-medic
-pip install -r ~/.claude/skills/data-medic/requirements.txt
+python ~/.claude/skills/data-medic/setup.py
 ```
 
-The folder must be called `data-medic` (skill names are lowercase with hyphens). For a single project, clone into `.claude/skills/data-medic` instead. For OpenAI Codex, clone into Codex's skills folder (for example `~/.codex/skills/data-medic`). Codex has not been tested yet; the skill uses only instructions and Python scripts, so it should work the same way.
+On Windows, use `py -3` instead of `python` if `python` isn't found. On macOS and Linux, `python3` may be the name.
+
+`setup.py` creates a private environment in the skill's `.venv` folder and installs everything in `requirements.txt` there. It doesn't touch your system Python or other projects. `scripts/dm.py` then uses that environment automatically, so there is nothing to activate. Other options:
+
+- `python setup.py --minimal` installs only the core libraries (pandas, numpy, scipy, matplotlib).
+- `python setup.py --check` shows what is installed.
+- To uninstall the libraries, delete the `.venv` folder.
+
+**Already have an environment with pandas?** You can skip `setup.py` and either install into it yourself with `pip install -r requirements.txt`, or point dataMedic at it by setting `DATAMEDIC_PYTHON` to that environment's Python executable.
+
+`python scripts/dm.py check` shows which Python and libraries dataMedic is using. If you skip installation, the agent will notice when it first runs and ask before installing anything.
+
+Where to clone:
+
+- The folder must be called `data-medic` (skill names are lowercase with hyphens).
+- For a single project, clone into `.claude/skills/data-medic` instead.
+- For OpenAI Codex, clone into Codex's skills folder (for example `~/.codex/skills/data-medic`). Codex has not been tested yet; the skill uses only instructions and Python scripts, so it should work the same way.
 
 Requirements:
 
@@ -73,7 +91,8 @@ Other commands:
 - `dm revert OUT --to original.csv` rebuilds the original;
 - `dm relate a.csv:id b.csv:a_id` checks keys and orphans between tables;
 - `dm calc OUT name "expression"` records a derived figure so the review can trace it;
-- `dm audit OUT` prints the operation log.
+- `dm audit OUT` prints the operation log;
+- `dm check` shows which Python and libraries are in use.
 
 ## Supported formats
 
@@ -107,7 +126,7 @@ datamedic_output/<dataset>/
 python -m pytest tests -q
 ```
 
-85 tests run against synthetic datasets with planted problems. The datasets cover:
+89 tests run against synthetic datasets with planted problems. The datasets cover:
 
 - sales;
 - heavy and patterned missingness;
@@ -141,7 +160,8 @@ The tests check that:
 - validation catches tampering;
 - runs are reproducible;
 - train/test leakage is prevented;
-- the review rejects invented numbers.
+- the review rejects invented numbers;
+- installation helpers pick the right Python and pass exit codes through.
 
 They pass on Windows 11 with Python 3.14 and pandas 3.1, and with Python 3.12 and pandas 2.3.
 
