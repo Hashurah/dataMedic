@@ -7,17 +7,22 @@ each other are reported as conflicts and never resolved silently. Passing a cont
 is consistent with the rules; it does not show the values are accurate.
 """
 
+import math
 import os
 import re
 
 import pandas as pd
 
 from .clean import _is_missing, _num, condition_mask
-from .common import DataMedicError, canon_series, canon_value, read_json
+from .common import DataMedicError, canon_series, canon_value, norm_label, read_json
 
 PROVENANCE = ("confirmed", "user", "inferred", "provisional")
 RULES = ("required_columns", "type", "range", "unique", "allowed", "not_null", "date_range", "pattern", "compare",
-         "conditional", "reference")
+         "conditional", "reference", "category_shares", "mean", "missing_share")
+# drift rules compare a batch with a saved baseline; their allowed band is z standard errors of the difference
+# between two samples unless the rule gives an explicit tolerance
+DRIFT_RULES = ("category_shares", "mean", "missing_share")
+ON_FAIL = ("warn", "halt")
 _OPS = {"<": "lt", "<=": "le", ">": "gt", ">=": "ge", "==": "eq", "!=": "ne"}
 
 
@@ -36,6 +41,10 @@ def load_contract(path):
         if r["provenance"] not in PROVENANCE:
             raise DataMedicError(f"contract rule {r['id']}: provenance must be one of {', '.join(PROVENANCE)}")
         r.setdefault("severity", "critical" if r["provenance"] in ("confirmed", "user") else "warning")
+        if r.get("on_fail", "warn") not in ON_FAIL:
+            raise DataMedicError(f"contract rule {r['id']}: on_fail must be 'warn' or 'halt'")
+        if r.get("on_fail") == "halt":
+            r["severity"] = "critical"  # a rule that stops the pipeline cannot be a mere warning
     c["_path"] = os.path.abspath(path)
     return c
 
@@ -90,6 +99,7 @@ def evaluate(contract, tv, text, base_dir=None):
     res = []
     for r in contract["rules"]:
         rec = {"id": r["id"], "rule": r["rule"], "provenance": r["provenance"], "severity": r["severity"],
+               "on_fail": r.get("on_fail", "warn"), "column": r.get("column", ""),
                "description": r.get("description", ""), "source": r.get("source", "")}
         try:
             failing, detail = _check(r, tv, text, base_dir)
@@ -188,4 +198,145 @@ def _check(r, tv, text, base_dir):
         raw = text[_col(tv, r["column"]).name]
         bad = (raw != "") & ~raw.isin(keys)
         return int(bad.sum()), f"{int(bad.sum())} values not found in {os.path.basename(path)}:{r['key']}"
+    if k in DRIFT_RULES:
+        return _drift(r, tv)
     raise DataMedicError(f"unknown rule {k}")
+
+
+# ---------------------------------------------------------------- drift against a baseline
+
+def _share_band(r, p0, n0, n1):
+    """Allowed absolute difference for a share: the rule's tolerance, else z standard errors of p1 - p0."""
+    if r.get("tolerance") is not None:
+        return float(r["tolerance"])
+    p = min(max(p0, 0.5 / n0), 1 - 0.5 / n0)  # keep a share of 0 or 1 from giving a zero-width band
+    return float(r.get("z", 3)) * math.sqrt(p * (1 - p) * (1 / n0 + 1 / max(n1, 1)))
+
+
+def _pct(x):
+    return f"{100 * x:.1f}%"
+
+
+def _drift(r, tv):
+    k, c = r["rule"], r["column"]
+    s = _col(tv, c)
+    n0 = int(r["n"])
+    if k == "category_shares":
+        vals = canon_series(s[~_is_missing(s)])
+        n1 = len(vals)
+        if n1 == 0:
+            return 1, "no recorded values to compare with the baseline"
+        # levels are matched ignoring case and spacing: a batch whose cleaning chose another spelling of the same
+        # label has not drifted, but the spelling change is reported
+        names, spelled = {}, []
+        for lv in r["shares"]:
+            names.setdefault(norm_label(lv), str(lv))
+        now = {}
+        for lv, v in vals.value_counts(normalize=True).items():
+            key = norm_label(lv)
+            now[key] = now.get(key, 0.0) + float(v)
+            if key in names and names[key] != lv:
+                spelled.append(f"{lv} (baseline {names[key]})")
+            names.setdefault(key, lv)
+        base = {}
+        for lv, v in r["shares"].items():
+            base[norm_label(lv)] = base.get(norm_label(lv), 0.0) + float(v)
+        new_levels = r.get("new_levels", "violation")
+        moved = []
+        for key in sorted(set(base) | set(now)):
+            p0, p1 = base.get(key, 0.0), now.get(key, 0.0)
+            if key not in base and new_levels == "ignore":
+                continue
+            band = _share_band(r, p0, n0, n1)
+            if abs(p1 - p0) > band:
+                moved.append((abs(p1 - p0) - band, f"{names[key]} {_pct(p0)} to {_pct(p1)}" +
+                              (" (new level)" if key not in base else f" (allowed +/-{100 * band:.1f} points)")))
+        moved.sort(key=lambda m: -m[0])
+        detail = f"{len(moved)} of {len(set(base) | set(now))} levels moved outside the band, n = {n1}"
+        detail += ": " + "; ".join(m[1] for m in moved[:5]) if moved else ""
+        if spelled:
+            detail += f"; spelled differently from the baseline (not counted as drift): {', '.join(spelled[:5])}"
+        return len(moved), detail
+    if k == "missing_share":
+        ind = r.get("indicator")
+        if ind and ind in tv.columns:
+            miss = tv[ind].astype("boolean").fillna(False) | _is_missing(s)
+        else:
+            miss = _is_missing(s)
+        n1 = len(s)
+        p0, p1 = float(r["share"]), float(miss.mean()) if n1 else 0.0
+        band = _share_band(r, p0, n0, n1)
+        bad = int(abs(p1 - p0) > band)
+        return bad, (f"missing {_pct(p1)} against {_pct(p0)} in the baseline "
+                     f"(allowed +/-{100 * band:.1f} points, n = {n1})")
+    x = _num(s)
+    ind = r.get("indicator")
+    if ind and ind in tv.columns:
+        x = x[~tv[ind].astype("boolean").fillna(False)]
+    x = x.dropna()
+    n1 = len(x)
+    if n1 == 0:
+        return 1, "no numeric values to compare with the baseline"
+    m0, m1, sd = float(r["mean"]), float(x.mean()), float(r.get("sd") or 0.0)
+    if r.get("tolerance") is not None:
+        band = float(r["tolerance"])
+    elif r.get("relative_tolerance") is not None:
+        band = abs(m0) * float(r["relative_tolerance"])
+    else:
+        band = float(r.get("z", 3)) * sd * math.sqrt(1 / n0 + 1 / n1)
+    bad = int(abs(m1 - m0) > band)
+    return bad, f"mean {m1:,.4g} against {m0:,.4g} in the baseline (allowed +/-{band:,.4g}, n = {n1})"
+
+
+def build_baseline(out_dir, z=3.0, halt=False, max_levels=None):
+    """A contract describing a cleaned run, for checking later batches: required columns, types, missing shares,
+    category shares and means. Every rule is 'inferred'. Drift rules warn by default; `halt` makes them stop the
+    pipeline (validation fails and eda refuses to run)."""
+    from .clean import read_str_csv
+    from .common import load_config, now_iso, read_json
+    from .validate import typed_view
+    schema = read_json(os.path.join(out_dir, "cleaned_data", "schema.json"))
+    plan = read_json(os.path.join(out_dir, "plan.json"))
+    roles = plan.get("roles", {})
+    raw = read_str_csv(os.path.join(out_dir, "cleaned_data", "cleaned_dataset.csv"))
+    tv = typed_view(raw, schema)
+    max_levels = max_levels or load_config("default.json")["eda"]["max_group_levels"]
+    cols = schema["columns"]
+    skip_values = set(roles.get("identifier", [])) | set(roles.get("sensitive", []))
+    added = {c for c, i in cols.items() if i.get("added_by_cleaning")}
+    indicators = {c[: -len("_was_missing")]: c for c in added if c.endswith("_was_missing")}
+    n = len(tv)
+    src = f"baseline from {out_dir} ({n} cleaned rows), {now_iso()[:10]}"
+    act = "halt" if halt else "warn"
+    rules = [{"rule": "required_columns", "columns": [c for c in cols if c not in added]}]
+    for c, info in cols.items():
+        if c in indicators.values():
+            continue  # an imputation indicator is folded into its column's missing share
+        if info["type"] in ("number", "integer", "date", "datetime", "boolean"):
+            rules.append({"rule": "type", "column": c, "type": info["type"]})
+        s = tv[c]
+        miss = _is_missing(s)
+        if c in indicators:
+            miss = miss | tv[indicators[c]].astype("boolean").fillna(False)
+        rules.append({"rule": "missing_share", "column": c, "share": round(float(miss.mean()), 6), "n": n, "z": z,
+                      "on_fail": act, **({"indicator": indicators[c]} if c in indicators else {})})
+        if c in skip_values:
+            continue
+        rec = s[~_is_missing(s)]
+        if info["type"] in ("number", "integer"):
+            x = _num(s[~miss]).dropna()  # observed values only: imputed ones would pull the mean to the fill value
+            if len(x) >= 5 and x.std() > 0:
+                rules.append({"rule": "mean", "column": c, "mean": round(float(x.mean()), 6),
+                              "sd": round(float(x.std()), 6), "n": int(len(x)), "z": z, "on_fail": act,
+                              **({"indicator": indicators[c]} if c in indicators else {})})
+        elif info["type"] in ("string", "boolean"):
+            vc = canon_series(rec).value_counts(normalize=True)
+            if 2 <= len(vc) <= max_levels:
+                rules.append({"rule": "category_shares", "column": c, "n": int(len(rec)), "z": z, "on_fail": act,
+                              "shares": {str(k): round(float(v), 6) for k, v in vc.items()}})
+    for i, r in enumerate(rules, 1):
+        r.update(id=f"B{i:03d}", provenance="inferred", source=src)
+    return {"description": "Baseline contract: later batches are compared with this run. Drift bands are z standard "
+                           "errors of the difference between two samples unless a rule sets 'tolerance' (absolute) "
+                           "or, for means, 'relative_tolerance'.",
+            "created": now_iso(), "baseline_rows": n, "z": z, "rules": rules}

@@ -141,11 +141,28 @@ class PlanBuilder:
         if len(cur) > 1 and t in ("integer", "float", "mixed"):
             self.issue("units", col, "high", "amounts in several currencies (" + ", ".join(f"{k}: {v}" for k, v in cur.items())
                        + "); they cannot be compared or summed without exchange rates", sum(cur.values()), n,
-                       evidence={"currencies": cur}, action="conversion proposed, disabled until amounts share one currency")
-            self.op("convert_type", {"column": col, "to": "number", "decimal": p.get("decimal_separator", ".")},
-                    "numbers stored as text in several currencies", "Converting would strip the currency symbols and "
-                    "mix currencies in one column. Convert to one currency first (add a currency column or rates), "
-                    "then enable.", enabled=False, needs_review=True, evidence={"currencies": cur})
+                       evidence={"currencies": cur}, action="currency copied to its own column; number conversion and "
+                       "conversion to one currency proposed, disabled until reviewed")
+            cur_col = f"{col}_currency"
+            ex = self.op("extract_currency", {"column": col, "to_column": cur_col},
+                         "currency stored inside the amount text", "Copies each amount's currency marker into "
+                         f"{cur_col} (values without one are labelled 'Unmarked'), so the amount can become a number "
+                         "without losing it. '$' is read as USD; set params.symbols if the source uses another dollar.",
+                         evidence={"currencies": cur})
+            num = self.op("convert_type", {"column": col, "to": "number", "decimal": p.get("decimal_separator", ".")},
+                    "numbers stored as text in several currencies", f"Safe to enable once {ex['op_id']} has kept the "
+                    "currency. The column will still hold several currencies: analyse it per currency, or convert "
+                    "with the convert_currency step.", enabled=False, needs_review=True,
+                    evidence={"currencies": cur})
+            num["depends_on"] = [ex["op_id"]]
+            conv = self.op("convert_currency", {"column": col, "currency_column": cur_col, "rates_file": "rates.csv",
+                                                "target": None, "date_column": None},
+                           "amounts in several currencies", "Needs exchange rates from you: a CSV in the output folder "
+                           "with currency,rate (and date, to use the rate of each row's date). Set target and, for "
+                           "dated rates, date_column. Rows whose currency has no rate (such as 'Unmarked') stay "
+                           "unconverted and are flagged.", enabled=False, needs_review=True,
+                           evidence={"currencies": cur})
+            conv["depends_on"] = [ex["op_id"], num["op_id"]]
             return
         pv = p.get("percent_sign_values", 0)
         if t in ("integer", "float") and 0 < pv < 0.5 * max(1, p["non_null_count"]):

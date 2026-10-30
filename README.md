@@ -109,6 +109,7 @@ Other commands:
 - `dm restore OUT --op OP-007` writes a copy of the cleaned data with one step undone;
 - `dm compare OUT column` scores imputation methods for one column on hidden known values;
 - `dm relate a.csv:id b.csv:a_id` checks keys and orphans between tables;
+- `dm baseline OUT --halt` saves a run's category shares, means and missing rates as a contract, so `dm run next_batch.csv --contract OUT/baseline_contract.json` stops before analysis if the new batch drifts;
 - `dm calc OUT name "expression"` records a derived figure so the review can trace it;
 - `dm audit OUT` prints the operation log;
 - `dm check` shows which Python and libraries are in use.

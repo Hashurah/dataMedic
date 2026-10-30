@@ -146,7 +146,8 @@ def run_clean(path, plan_path, out_dir, load_options=None, write_reference=True,
     if out_dir and not os.path.exists(os.path.join(out_dir, "plan.json")):
         shutil.copy2(plan_path, os.path.join(out_dir, "plan.json"))
     sensitive = plan.get("roles", {}).get("sensitive", [])
-    eng = Engine(raw, plan, sensitive=sensitive, max_risk=max_risk).run()
+    eng = Engine(raw, plan, sensitive=sensitive, max_risk=max_risk,
+                 base_dir=os.path.dirname(os.path.abspath(plan_path))).run()
     cleaned = write_outputs(eng, out_dir, meta)
     if quiet:
         return eng

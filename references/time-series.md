@@ -11,6 +11,14 @@
 5. **Seasonality**: day of week for daily data, autocorrelation at the season lag when there are three or more cycles.
 6. **Closures**: weekends, holidays and shutdowns produce gaps that are not missing data. A shop closed on Sunday has no Sunday sales, which is different from an unknown value. Never fill such periods. If the series has gaps of that kind, keep them, and if needed aggregate to a period where they do not matter.
 
+## Missing dates
+
+`eda` diagnoses every date column with missing values under `missing_dates` in `eda_results.json`. It fills nothing.
+
+- **Why each date is missing**, from the audit trail: blank in the source, placeholder text, not readable as a date, ambiguous day/month order (both readings valid and different), or set missing by a rule (with the rule's reason). These need different fixes, so report them separately.
+- **Whether missing dates cluster.** A Wald-Wolfowitz runs test along file order and along each numeric identifier (trailing numbers of codes such as TXN-00042 count): fewer, longer runs than chance suggest a batch or an ingestion outage. The longest run is reported against the longest expected by chance, with the missing share by tenth of the order and a chi-square test across tenths. A significant clustered result becomes a "missing data pattern" finding candidate.
+- **When they happened.** Only if an order key tracks the date closely (rank correlation at least 0.9, `missing_dates.chronological_rho`), each missing date is placed approximately at its previous dated neighbour, and the missing share is given by period and by weekday with a chi-square test. Otherwise the report says the dates cannot be placed: when IDs are not issued in date order, a neighbour's date says nothing about the missing one, and filling it would invent the date.
+
 ## Filling a value inside the series
 
 Filling a missing value at an existing timestamp is different from adding missing timestamps. dataMedic only does the first; it never invents rows for missing timestamps.

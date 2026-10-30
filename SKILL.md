@@ -95,6 +95,8 @@ Then **review the plan yourself**. This is where your judgement goes:
    - Row decisions beyond flags are yours: `quarantine_rows` for records that cannot be trusted yet, and `flag_rows` with `exclude_from` to keep a row but leave it out of one statistic.
    - Business rules the user states go in as `apply_rule` with a `source` (`references/data-contracts.md`).
 
+   - Amounts with currency symbols: the planner adds `extract_currency` (the marker goes into its own column) and leaves the number conversion disabled for you to enable. To put everything in one currency, enable `convert_currency` with a rates file the user supplies; never invent or download rates. Unmarked amounts stay unconverted until the user says what currency they are.
+
    The operation catalogue, the stage order, `depends_on` and the risk levels are in `references/plan-operations.md`.
 4. If the user has expectations the cleaned data must meet, write them as a contract in `OUT/contract.json` with each rule's provenance (`references/data-contracts.md`).
 5. Consult references only as needed:
@@ -169,7 +171,11 @@ It also runs:
 
 Variables are chosen by how informative they are (completeness, spread, link to the outcome, domain priority), not by column position. The ranking is recorded under `variable_selection`.
 
-Rows flagged with `exclude_from` are left out of those columns' statistics, and this is reported. Rows unusual across several continuous measures are listed in `analysis/multivariate_anomalies.csv`: flagged, never changed.
+Rows flagged with `exclude_from` are left out of those columns' statistics, and this is reported. Rows unusual across several continuous measures are listed in `analysis/multivariate_anomalies.csv`: flagged, never changed. Every scored row's scores and percentiles are in `analysis/anomaly_scores.csv` (relative ranks, not probabilities).
+
+Missing dates are diagnosed under `missing_dates`: why each is missing (blank, unreadable, ambiguous day/month, set missing by a rule), whether they cluster along file or ID order (runs test), and, only when IDs follow the date, when they happened. Nothing is filled.
+
+If validation failed on a contract rule with `"on_fail": "halt"`, `eda` refuses to run. Report the drift; do not pass `--ignore-halt` unless the user accepts the shift.
 
 Output: `analysis/eda_results.json`, charts in `visualisations/` (matplotlib, with seaborn for statistical charts when installed; index in `visualisations/chart_index.json`), and ranked `finding_candidates`.
 
@@ -240,6 +246,7 @@ If any critical step failed, say so first and do not call the work complete.
 | `dm revert OUT [--to FILE]` | rebuild the whole original table and check it matches |
 | `dm audit OUT` | print the transformation log |
 | `dm relate PARENT:KEY CHILD:KEY` | key uniqueness and referential integrity between two tables |
+| `dm baseline OUT [--to FILE] [--z 3] [--halt]` | save a cleaned run's category shares, means and missing rates as a contract; check later batches with `dm validate NEW_OUT --contract FILE` (`references/data-contracts.md`) |
 
 ## Quick path
 

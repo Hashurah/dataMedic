@@ -31,8 +31,8 @@ Every operation has a `risk`. The planner sets it, and you may change it with a 
 
 | Risk | Meaning | Default for |
 |---|---|---|
-| `safe` | cannot lose information: formatting, recognised placeholders, label case, lossless type conversion, removing empty rows or columns, flags | `rename_columns`, `trim_whitespace`, `standardize_missing`, `standardize_categories`, `flag_rows`, and conversions where every value parses |
-| `moderate` | changes values in a documented, reversible way that a reader should know about | `convert_type` with failures, `fix_encoding`, `replace_values`, `set_missing_where`, `drop_duplicates`, `impute`, `apply_rule` |
+| `safe` | cannot lose information: formatting, recognised placeholders, label case, lossless type conversion, removing empty rows or columns, flags | `rename_columns`, `trim_whitespace`, `standardize_missing`, `extract_currency`, `standardize_categories`, `flag_rows`, and conversions where every value parses |
+| `moderate` | changes values in a documented, reversible way that a reader should know about | `convert_type` with failures, `fix_encoding`, `replace_values`, `set_missing_where`, `drop_duplicates`, `impute`, `apply_rule`, `convert_currency` |
 | `high` | removes rows or columns with content, or reshapes a distribution | `drop_rows` (except empty rows), `drop_columns` (except empty columns), `quarantine_rows`, `winsorize` |
 
 - `dm clean OUT` applies every enabled step.
@@ -52,17 +52,19 @@ Operations run in this fixed stage order, whatever their position in the file (t
 3. `trim_whitespace`
 4. `fix_encoding`
 5. `standardize_missing`: placeholders become missing before types are inferred.
-6. `convert_type`: types come before any numeric rule or statistic.
-7. `standardize_categories`
-8. `replace_values`
-9. `set_missing_where`: impossible values and missing-value codes become missing before duplicates are compared.
-10. `drop_duplicates`: compares every recorded column, before any column is dropped and before rules or imputation fill values. Two rows that differ only in a column that is dropped later are not duplicates.
-11. `drop_columns`
-12. `apply_rule`: documented business rules fill or set values.
-13. `quarantine_rows`: rows set aside here are not used to fit imputation.
-14. `impute`: fitted on the remaining, deduplicated rows.
-15. `winsorize`
-16. `flag_rows`: evaluated on the final values.
+6. `extract_currency`: currency markers are copied out before type conversion strips them.
+7. `convert_type`: types come before any numeric rule or statistic.
+8. `standardize_categories`
+9. `replace_values`
+10. `set_missing_where`: impossible values and missing-value codes become missing before duplicates are compared.
+11. `drop_duplicates`: compares every recorded column, before any column is dropped and before rules or imputation fill values. Two rows that differ only in a column that is dropped later are not duplicates.
+12. `drop_columns`
+13. `apply_rule`: documented business rules fill or set values.
+14. `quarantine_rows`: rows set aside here are not used to fit imputation.
+15. `impute`: fitted on the remaining, deduplicated rows.
+16. `convert_currency`: converts the final amounts, after invalid values are cleared and gaps filled.
+17. `winsorize`
+18. `flag_rows`: evaluated on the final values.
 
 `"depends_on": ["OP-003"]` makes a step run only if those steps were applied. If a prerequisite is disabled, held back by the risk limit or failed, the step is logged as "not applied (depends on ...)".
 
@@ -77,6 +79,7 @@ A dependency on a step that runs later in the stage order fails with an explanat
 | `trim_whitespace` | `columns`, `collapse_internal` (bool) | Strips surrounding spaces; optionally collapses repeated inner spaces. |
 | `fix_encoding` | `columns` | Re-decodes UTF-8 text that was read as Windows-1252 (`cafÃ©` becomes `café`). Changes a value only if the round trip is exact and leaves no garbling markers. |
 | `standardize_missing` | `column`, `tokens` | Replaces exact (trimmed) placeholder tokens with missing. |
+| `extract_currency` | `column`, `to_column` (default `<column>_currency`), `symbols` {marker: code}, `unmarked` (default `"Unmarked"`) | Adds a column with each amount's currency (£ becomes GBP, $ USD, € EUR; ISO codes such as `USD 12` are read too). Amounts with no marker get `unmarked`; missing amounts stay missing. The amount itself is not changed, so its `convert_type` can then run without losing the currency. `$` is read as USD: pass `symbols: {"$": "CAD"}` when the source says so. Revert drops the column. |
 | `convert_type` | `column`, `to` (`number`, `integer`, `date`, `datetime`, `boolean`, `string`), `decimal` (`.` or `,`), `date_order` (`dmy`, `mdy` or null), `allow_compact` (accept 20240131), `unit`, `on_error` (`set_missing` or `abort`) | Parses text. Values that fail become missing, are flagged as "conversion failure", and keep their original text in the change log, so a failure is never silent. Integer conversion falls back to number if decimals appear. Mixed time-zone awareness stops the conversion. Use `on_error: "abort"` when no failure is acceptable. |
 | `standardize_categories` | `column`, `mapping` {variant: canonical} | Merges label variants. |
 | `replace_values` | `column`, `mapping`, `reason` | Corrections backed by independent evidence (a lookup table, the user's confirmation). Never for guesses. |
@@ -86,6 +89,7 @@ A dependency on a step that runs later in the stage order fails with an explanat
 | `apply_rule` | `rule_id`, `when` (conditions), `set` {column: value}, `source` (required), `only_if_missing` (default true), `description` | Applies a documented business rule. Two rules that would set the same cell to different values fail the second step and change nothing. See `data-contracts.md`. |
 | `quarantine_rows` | `rule`, `reason`, `column` | Moves rows out of the cleaned data into `audit/quarantined_records.csv` (and `removed_records.csv`) until an issue is resolved. Their row status is "quarantined". |
 | `impute` | `column`, `method`, plus method parameters (below), `add_indicator` (default true), `fit_on`, `source` | Fills missing values, adds `<column>_was_missing`, and writes one evidence record per filled cell to `audit/imputation_evidence.csv`. |
+| `convert_currency` | `column` (numeric amount), `currency_column`, `rates_file`, `target`, `date_column` (needed for dated rates), `output_column` (default `<column>_<target>`), `decimals` (default 2) | Writes `<output_column>`, `<column>_fx_rate` and, for dated rates, `<column>_fx_rate_date`. The amount and currency columns are kept. `rates_file` is a CSV you supply (relative paths resolve against the folder holding `plan.json`) with `currency` and `rate` (units of `target` per one unit), and optionally `date`: each row then uses the latest rate on or before its date. Rows in the target currency get rate 1. Rows whose currency has no rate (such as `Unmarked`), or with no date or a date before the first rate, stay unconverted and are flagged "not converted". The file's sha256 is logged, and validation recomputes every converted value. Rates are never fetched from the internet. |
 | `winsorize` | `column`, `lower_q`, `upper_q`, `fit_on` | Clips to quantiles. Never automatic; needs a documented analytical reason. |
 | `flag_rows` | `rule`, `reason`, `column`, `classification`, `exclude_from` | Lists rows in `audit/flagged_records.csv`. Changes nothing. `exclude_from: ["income"]` (or `["all"]`) also leaves those rows out of the named columns' analysis in `eda`. The rows stay in the cleaned data. |
 

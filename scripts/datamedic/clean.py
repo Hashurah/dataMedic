@@ -8,6 +8,7 @@ the cleaned data and the audit files and checks it against the original.
 
 import csv
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -17,7 +18,8 @@ from .common import (ROW_ID, DataMedicError, canon_frame, canon_series, canon_va
 
 STAGE = {
     "rename_columns": "structure", "drop_rows": "structure", "trim_whitespace": "standardise text",
-    "fix_encoding": "standardise text", "standardize_missing": "missing values", "convert_type": "data types",
+    "fix_encoding": "standardise text", "standardize_missing": "missing values", "extract_currency": "units",
+    "convert_type": "data types", "convert_currency": "units",
     "standardize_categories": "standardise text", "replace_values": "corrections", "set_missing_where": "invalid values",
     "drop_duplicates": "duplicates", "drop_columns": "structure", "apply_rule": "domain rules",
     "quarantine_rows": "row decisions", "impute": "missing values", "winsorize": "outliers", "flag_rows": "review flags",
@@ -25,18 +27,25 @@ STAGE = {
 # Fixed stage order. Each stage needs the ones before it: placeholders are normalised before empty-row and type
 # checks; types before numeric rules; duplicates are judged on every recorded column, before any column is dropped
 # and before rules or imputation fill values; quarantined rows are set aside before imputation statistics are fitted.
-OP_ORDER = ["rename_columns", "drop_rows", "trim_whitespace", "fix_encoding", "standardize_missing", "convert_type",
-            "standardize_categories", "replace_values", "set_missing_where", "drop_duplicates", "drop_columns",
-            "apply_rule", "quarantine_rows", "impute", "winsorize", "flag_rows"]
+# Currency markers are read before type conversion strips them; conversion to one currency runs on the final amounts.
+OP_ORDER = ["rename_columns", "drop_rows", "trim_whitespace", "fix_encoding", "standardize_missing", "extract_currency",
+            "convert_type", "standardize_categories", "replace_values", "set_missing_where", "drop_duplicates",
+            "drop_columns", "apply_rule", "quarantine_rows", "impute", "convert_currency", "winsorize", "flag_rows"]
 RISK_RANK = {"safe": 0, "moderate": 1, "high": 2}
 DEFAULT_RISK = {
     "rename_columns": "safe", "trim_whitespace": "safe", "standardize_missing": "safe",
     "standardize_categories": "safe", "flag_rows": "safe", "fix_encoding": "moderate", "convert_type": "moderate",
     "replace_values": "moderate", "set_missing_where": "moderate", "drop_duplicates": "moderate", "impute": "moderate",
-    "apply_rule": "moderate", "drop_rows": "high", "drop_columns": "high", "quarantine_rows": "high", "winsorize": "high",
+    "apply_rule": "moderate", "extract_currency": "safe", "convert_currency": "moderate", "drop_rows": "high",
+    "drop_columns": "high", "quarantine_rows": "high", "winsorize": "high",
 }
 # methods whose filled value can depend on observations later in time
 FUTURE_METHODS = {"interpolate", "bfill"}
+# symbol to ISO code; "$" is also the sign of CAD, AUD and others, so pass `symbols` when the source says so
+CURRENCY_SYMBOLS = {"$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY", "₦": "NGN", "₹": "INR", "₩": "KRW", "₽": "RUB"}
+_ISO = r"USD|EUR|GBP|NGN|JPY|CAD|AUD|INR|CHF|CNY|KRW|RUB|ZAR|NZD|SEK|NOK|DKK|MXN|BRL"
+_CURRENCY_TOKEN = re.compile(rf"^\s*[+-]?\s*([$€£¥₦₹₩₽]|(?:{_ISO})(?![A-Za-z]))"
+                             rf"|([$€£¥₦₹₩₽]|(?<![A-Za-z])(?:{_ISO}))\s*$", re.I)
 
 
 def op_risk(op):
@@ -183,8 +192,9 @@ def rule_mask(df, column, rule, today=None):
 
 
 class Engine:
-    def __init__(self, raw, plan, sensitive=(), max_risk=None, collect_evidence=True):
+    def __init__(self, raw, plan, sensitive=(), max_risk=None, collect_evidence=True, base_dir=None):
         self.raw = raw
+        self.base_dir = base_dir or os.getcwd()  # relative file paths in the plan (rates files) resolve here
         self.df = raw.copy()
         self.plan = plan
         self.seed = plan.get("settings", {}).get("seed", 42)
@@ -414,6 +424,34 @@ class Engine:
         counts = self._diff(op_id, [column], before)
         return {"affected": counts.get(column, 0), "method": "placeholder to missing", "details": {"tokens": tokens},
                 "reversal": "original placeholders in audit/cell_changes.csv"}
+
+    def op_extract_currency(self, op_id, column, to_column=None, symbols=None, unmarked="Unmarked"):
+        """Copy the currency marker of each amount into its own column, so the amount can become a number without
+        losing it. The amount column is not changed here. Values with no marker get `unmarked`; missing amounts stay
+        missing in both columns."""
+        to_column = to_column or f"{column}_currency"
+        if to_column in self.df.columns:
+            raise DataMedicError(f"{op_id}: column {to_column} already exists; choose another to_column")
+        table = {**CURRENCY_SYMBOLS, **(symbols or {})}
+
+        def code(v):
+            if v is None or (isinstance(v, float) and np.isnan(v)) or (isinstance(v, str) and not v.strip()):
+                return None
+            m = _CURRENCY_TOKEN.search(str(v))
+            if not m:
+                return unmarked
+            tok = (m.group(1) or m.group(2)).strip()
+            return table.get(tok, table.get(tok.upper(), tok.upper()))
+
+        out = self.df[column].map(code)
+        self.df.insert(list(self.df.columns).index(column) + 1, to_column, out)
+        self.added_columns.append(to_column)
+        self.schema[to_column] = {"type": "string", "derived_from": column}
+        counts = {str(k): int(v) for k, v in out.value_counts().items()}
+        return {"affected": int(out.notna().sum()), "method": "currency marker copied to its own column",
+                "details": {"column_added": to_column, "counts": counts, "symbol_table": table},
+                "added_columns": [to_column], "status": f"applied: {to_column} added",
+                "reversal": f"drop column {to_column}; the amount column was not changed by this step"}
 
     def op_convert_type(self, op_id, column, to, decimal=".", date_order=None, allow_compact=False,
                         on_error="set_missing", unit=None):
@@ -770,6 +808,92 @@ class Engine:
                 "reversal": "imputed cells listed with original (empty) values in audit/cell_changes.csv"
                 + (f"; indicator column {basis.get('indicator_column')} marks them" if add_indicator else "")}
 
+    def op_convert_currency(self, op_id, column, currency_column, rates_file, target, date_column=None,
+                            output_column=None, decimals=2):
+        """Convert amounts to one currency with rates the user supplies, into new columns. The amount and currency
+        columns are kept as they are. `rates_file` is a CSV with `currency` and `rate` (units of `target` per one
+        unit of `currency`) and, optionally, `date`: then each row uses the latest rate on or before its
+        `date_column` value. Rows with no matching rate are left unconverted and flagged, never guessed."""
+        if not target:
+            raise ValueError("set params.target to the reporting currency (for example 'USD')")
+        path = rates_file if os.path.isabs(rates_file) else os.path.join(self.base_dir, rates_file)
+        if not os.path.exists(path):
+            raise ValueError(f"rates file not found: {path}")
+        from .common import sha256_file
+        rates = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8")
+        rates.columns = [c.strip().lower() for c in rates.columns]
+        if not {"currency", "rate"} <= set(rates.columns):
+            raise ValueError("the rates file needs 'currency' and 'rate' columns")
+        rates["currency"] = rates["currency"].str.strip().str.upper()
+        rates["rate"] = pd.to_numeric(rates["rate"], errors="coerce")
+        if rates["rate"].isna().any() or (rates["rate"] <= 0).any():
+            raise ValueError("every rate must be a positive number")
+        dated = "date" in rates.columns
+        amt = _num(self.df[column])
+        if amt.notna().sum() == 0 and (~_is_missing(self.df[column])).any():
+            raise ValueError(f"{column} is not numeric; enable its convert_type step first")
+        cur = self.df[currency_column].map(
+            lambda v: str(v).strip().upper() if isinstance(v, str) and v.strip() else None)
+        rate = pd.Series(np.nan, index=self.df.index)
+        rate_date = pd.Series(pd.NaT, index=self.df.index, dtype="datetime64[ns]")
+        tgt = str(target).strip().upper()
+        if dated:
+            if not date_column:
+                raise ValueError("the rates file has dates; set params.date_column to the transaction date column")
+            rates["date"] = pd.to_datetime(rates["date"], errors="coerce")
+            if rates["date"].isna().any():
+                raise ValueError("every rate needs a readable date (YYYY-MM-DD)")
+            when = pd.to_datetime(self.df[date_column], errors="coerce")
+            if getattr(when.dt, "tz", None) is not None:
+                when = when.dt.tz_convert(None)
+            for c, g in rates.sort_values("date").groupby("currency"):
+                rows = (cur == c) & when.notna()
+                if not rows.any():
+                    continue
+                left = pd.DataFrame({"when": when[rows].astype("datetime64[ns]").values,
+                                     "i": self.df.index[rows]}).sort_values("when")
+                right = g[["date", "rate"]].astype({"date": "datetime64[ns]"})
+                m = pd.merge_asof(left, right, left_on="when", right_on="date", direction="backward")
+                rate.loc[m["i"].values] = m["rate"].values
+                rate_date.loc[m["i"].values] = m["date"].values
+        else:
+            dup = rates["currency"][rates["currency"].duplicated()].unique().tolist()
+            if dup:
+                raise ValueError(f"several rates for {', '.join(dup)} but no 'date' column to choose between them")
+            rate = cur.map(dict(zip(rates["currency"], rates["rate"]))).astype(float)
+        rate[cur == tgt] = 1.0
+        out_col = output_column or f"{column}_{tgt}"
+        rate_col = f"{column}_fx_rate"
+        added = [out_col, rate_col] + ([f"{column}_fx_rate_date"] if dated else [])
+        clash = [c for c in added if c in self.df.columns]
+        if clash:
+            raise ValueError(f"columns already exist: {', '.join(clash)}; set output_column")
+        converted = (amt * rate).round(decimals)
+        pos = list(self.df.columns).index(column) + 1
+        self.df.insert(pos, out_col, converted)
+        self.df.insert(pos + 1, rate_col, rate)
+        self.schema[out_col] = {"type": "number", "derived_from": column, "currency": tgt}
+        self.schema[rate_col] = {"type": "number", "derived_from": currency_column}
+        if dated:
+            self.df.insert(pos + 2, added[2], rate_date.dt.strftime("%Y-%m-%d").where(rate_date.notna(), None))
+            self.schema[added[2]] = {"type": "date", "derived_from": rates_file}
+        self.added_columns.extend(added)
+        no_rate = amt.notna() & rate.isna()
+        reasons = cur[no_rate].fillna("currency missing").value_counts().to_dict()
+        n_flag = self._flag(op_id, no_rate, column, f"not converted to {tgt}: no rate for this currency"
+                            + (" on or before this date" if dated else ""), "not converted")
+        n_conv = int(converted.notna().sum())
+        return {"affected": n_conv, "flagged": n_flag, "method": f"converted to {tgt} with supplied rates",
+                "statistical_basis": {"rates_file": rates_file, "rates_sha256": sha256_file(path), "target": tgt,
+                                      "rate_rule": "latest rate on or before the row's date" if dated
+                                      else "one rate per currency",
+                                      "currencies_with_rates": sorted(rates["currency"].unique().tolist()),
+                                      "decimals": decimals, "output_column": out_col, "rate_column": rate_col},
+                "details": {"converted": n_conv, "not_converted": int(no_rate.sum()),
+                            "not_converted_by_currency": {str(k): int(v) for k, v in reasons.items()}},
+                "added_columns": added, "status": f"applied: {n_conv} converted, {int(no_rate.sum())} without a rate",
+                "reversal": f"drop columns {', '.join(added)}; {column} and {currency_column} were not changed"}
+
     def op_winsorize(self, op_id, column, lower_q=0.01, upper_q=0.99, fit_on=None):
         s = _num(self.df[column])
         fit = s
@@ -835,8 +959,8 @@ def write_outputs(engine, out_dir, raw_meta, excel=True):
         kind = engine.schema.get(c, {}).get("type") or (
             "boolean" if dt in ("bool", "boolean") else "integer" if dt == "Int64" else
             "number" if dt.startswith("float") else "datetime" if dt.startswith("datetime") else "string")
-        if c in engine.added_columns:
-            kind = "boolean"
+        if c in engine.added_columns and not engine.schema.get(c, {}).get("type"):
+            kind = "boolean"  # imputation indicators
         schema["columns"][c] = {"type": kind, "pandas_dtype": dt, "added_by_cleaning": c in engine.added_columns,
                                 "sensitive": c in engine.sensitive, **{k: v for k, v in engine.schema.get(c, {}).items()
                                                                        if k != "type"}}
@@ -999,9 +1123,10 @@ def restore_step(out_dir, op_id):
         report["notes"].append(f"{report['cells_changed_again_later']} restored cells had been changed again by later "
                                "steps; those later changes are not in this copy")
     ind = (entry.get("statistical_basis") or {}).get("indicator_column")
-    if ind and ind in df.columns:
-        df = df.drop(columns=[ind])
-        report["columns_dropped"].append(ind)
+    for c in ([ind] if ind else []) + list(entry.get("added_columns") or []):
+        if c in df.columns:
+            df = df.drop(columns=[c])
+            report["columns_dropped"].append(c)
     if entry.get("op") == "drop_columns":
         rc = read_str_csv(os.path.join(ad, "removed_columns.csv"))
         rc.index = rc[ROW_ID].astype(int).tolist()

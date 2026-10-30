@@ -80,7 +80,12 @@
     "min_rows": 50,
     "contamination": "auto",
     "max_rows_listed": 200,
-    "robust_distance_quantile": 0.999
+    "robust_distance_quantile": 0.999,
+    "write_row_scores": true
+  },
+  "missing_dates": {
+    "chronological_rho": 0.9,
+    "_why": "Missing dates are placed in time by their neighbours only when an order key (file order or a numeric ID) tracks the date this closely; below it, a neighbour's date says nothing about the missing one."
   },
   "report": {
     "preview_rows": 500,

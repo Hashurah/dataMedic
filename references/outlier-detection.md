@@ -38,6 +38,7 @@ The flag rule chosen automatically is IQR, or IQR on the log scale when skewness
 Results:
 
 - `analysis/multivariate_anomalies.csv`: one row per flagged record, with its scores and its three main drivers;
+- `analysis/anomaly_scores.csv`: every scored row, with each method's score in its own units, its percentile within this dataset, and whether it was listed. Use the percentiles to rank rows for review or to compare the two methods. The scores are relative and are not probabilities of error: there is no calibration that would turn them into a 0 to 1 risk. Do not use them as row weights in model training without a reason, because that quietly down-weights rare but real records (`anomalies.write_row_scores: false` in the config turns the file off);
 - `eda_results.json` under `multivariate.anomalies`;
 - a chart of the two main components.
 

@@ -234,6 +234,16 @@ def validate(out_dir, replay=True, contract_path=None):
                 shrink = 1 - a["std"] / b["std"]
                 ck.add(f"imputation kept the spread of {c}", shrink < 0.2, WARNING,
                        detail=f"standard deviation changed by {-shrink * 100:.1f}%")
+        if e.get("op") == "convert_currency" and str(e.get("status", "")).startswith("applied"):
+            sb = e.get("statistical_basis", {})
+            oc, rc = sb.get("output_column"), sb.get("rate_column")
+            if oc in tv.columns and rc in tv.columns:
+                amt, rate, got = (pd.to_numeric(tv[c], errors="coerce") for c in (e["column"], rc, oc))
+                both = amt.notna() & rate.notna()
+                tol = 0.5 * 10 ** -sb.get("decimals", 2) + 1e-9
+                bad = int((both & ((amt * rate - got).abs() > tol)).sum() + (~both & got.notna()).sum())
+                ck.add(f"{oc} equals {e['column']} x {rc}", bad == 0,
+                       detail=f"{bad} rows differ" if bad else f"{int(both.sum())} converted rows recomputed")
         if e.get("status") == "failed":
             ck.add(f"operation {e['op_id']} ran", False, detail=e.get("error", ""))
     # 11. reversibility: rebuild the original from cleaned data + audit files

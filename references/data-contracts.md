@@ -73,6 +73,36 @@ Set `severity` explicitly to override the default.
 
 **Conflicting rules** are reported as warnings and not resolved. Examples: ranges that do not overlap; allowed lists that share nothing; one column declared with two types; a range that contains none of the allowed values. Decide which rule holds, fix the contract, then validate again.
 
+### Drift against a baseline
+
+A baseline contract describes one cleaned run so later batches can be checked against it. Build it with `dm baseline OUT` (written to `OUT/baseline_contract.json`), then check a new batch with `dm validate NEW_OUT --contract OUT/baseline_contract.json` or `dm run NEW_FILE --contract ...`.
+
+The baseline holds the required columns, column types and three drift rules:
+
+```json
+{"id": "B012", "rule": "category_shares", "column": "category", "shares": {"Electronics": 0.37, "Clothing": 0.26},
+ "n": 5951, "z": 3, "new_levels": "violation", "on_fail": "warn", "provenance": "inferred"}
+{"id": "B016", "rule": "mean", "column": "amount", "mean": 1227.8, "sd": 733.7, "n": 5714, "z": 3,
+ "indicator": "amount_was_missing", "on_fail": "warn", "provenance": "inferred"}
+{"id": "B020", "rule": "missing_share", "column": "quantity", "share": 0.021, "n": 6000, "z": 3,
+ "indicator": "quantity_was_missing", "on_fail": "warn", "provenance": "inferred"}
+```
+
+- **The band.** By default a value drifts when it moves more than `z` standard errors of the difference between two samples: for a share, `z * sqrt(p(1-p)(1/n_baseline + 1/n_batch))`; for a mean, `z * sd * sqrt(1/n_baseline + 1/n_batch)`. The band narrows as batches grow, so a 7% category in 6,000 rows is not flagged for moving 0.3 points by chance, while a large batch shows real shifts. A single fixed percentage would either fire constantly on small categories or miss shifts in large ones.
+- **Fixed bands.** Set `"tolerance"` (absolute: share points as a fraction, or the mean's units) or, for means, `"relative_tolerance"` (0.05 = 5% of the baseline mean) on a rule to use a business threshold instead.
+- **Labels** are matched ignoring case and spacing. A batch whose cleaning chose another spelling of the same label is reported in the detail, not counted as drift. A label the baseline never had counts as drift unless the rule says `"new_levels": "ignore"`.
+- **Imputed values** are left out: `indicator` names the `_was_missing` column, so the missing share counts the values that were missing before imputation and the mean uses observed values only.
+- Identifiers and sensitive columns get no share or mean rules.
+
+`on_fail` decides what a failure does:
+
+| `on_fail` | Effect |
+|---|---|
+| `warn` (default) | the check fails as a warning; validation passes with warnings |
+| `halt` | the check is critical, validation fails, and `dm eda` refuses to run until the data or the contract is fixed (`--ignore-halt` overrides, and should be explained) |
+
+`dm baseline OUT --halt` sets `halt` on every drift rule; `--z` changes the band width. Baselines are inferred, so drift is a reason to look, not proof of an error: a real change in the business moves the numbers too. When a shift is expected, rebuild the baseline from a run that includes it.
+
 ## What passing proves
 
 Passing a contract shows the data is **consistent** with the rules. It does not show the values are **accurate**. A plausible but wrong age passes a 0 to 120 range.

@@ -5,7 +5,8 @@
   profile  FILE [--out DIR]         baseline profile, issues and a proposed plan.json (changes nothing)
   clean    OUT [--safe-only | --max-risk LEVEL]  apply OUT/plan.json; writes cleaned data and the audit trail
   validate OUT [--contract FILE]    independent checks, including revert, replay and a data contract
-  eda      OUT [--target C --time C]  exploratory analysis and tests on the cleaned data
+  baseline OUT [--to FILE --halt]   save this run's shares, means and missing rates as a contract for later batches
+  eda      OUT [--target C --time C]  exploratory analysis and tests on the cleaned data (stops if a 'halt' rule failed)
   report   OUT [--interactive]      generated reports (quality, EDA, HTML audit, Excel audit)
   compare  OUT COLUMN               masked-value comparison of imputation methods for one column
   restore  OUT --op OP-ID           copy of the cleaned data with one step undone (cleaned data untouched)
@@ -188,13 +189,31 @@ def cmd_validate(a):
 def cmd_eda(a):
     from datamedic.eda import EDA
     from datamedic.pipeline import mark
-    res = EDA(a.out, target=a.target, time_col=a.time, charts_on=not a.no_charts).run()
+    res = EDA(a.out, target=a.target, time_col=a.time, charts_on=not a.no_charts,
+              ignore_halt=getattr(a, "ignore_halt", False)).run()
     mark(a.out, "explore")
     print(f"EDA: {len(res['measures'])} measures, {len(res['categories'])} grouping columns, time column "
           f"{res['time_column'] or 'none'}, {res['tests']['count']} tests, {len(res['charts'])} charts")
     for c in res["finding_candidates"][:10]:
         print(f"  {c['candidate_id']} [{c['type']}] {c['title']}")
     print("Written: analysis/eda_results.json, visualisations/")
+    return 0
+
+
+def cmd_baseline(a):
+    from datamedic.common import write_json
+    from datamedic.contracts import build_baseline
+    c = build_baseline(a.out, z=a.z, halt=a.halt)
+    dst = a.to or os.path.join(a.out, "baseline_contract.json")
+    write_json(dst, c)
+    kinds = {}
+    for r in c["rules"]:
+        kinds[r["rule"]] = kinds.get(r["rule"], 0) + 1
+    print(f"Baseline: {c['baseline_rows']} rows, " + ", ".join(f"{v} {k}" for k, v in kinds.items()))
+    print(f"Drift rules {'halt the pipeline' if a.halt else 'warn'} when a batch moves more than {a.z:g} standard "
+          "errors from this run (set 'tolerance' on a rule to use a fixed band instead).")
+    print(f"Written: {dst}")
+    print("Use it on a new batch: dm validate NEW_OUT --contract " + dst)
     return 0
 
 
@@ -253,7 +272,7 @@ def cmd_restore(a):
     write_json(os.path.splitext(dest)[0] + "_report.json", rep_)
     print(f"{a.op} ({rep_['op']}) undone in a copy: {rep_['cells_restored']} cells and {rep_['rows_restored']} rows "
           f"restored" + (f", columns back: {', '.join(rep_['columns_restored'])}" if rep_["columns_restored"] else "")
-          + (f", indicator dropped: {', '.join(rep_['columns_dropped'])}" if rep_["columns_dropped"] else ""))
+          + (f", added columns dropped: {', '.join(rep_['columns_dropped'])}" if rep_["columns_dropped"] else ""))
     for n in rep_["notes"]:
         term.line("  note: " + n, "warn")
     print(f"Written: {dest} (the cleaned data in cleaned_data/ is unchanged)")
@@ -408,8 +427,16 @@ def main(argv=None):
     s.add_argument("--no-replay", action="store_true")
     s.add_argument("--contract", help="data contract JSON (default: OUT/contract.json if present)")
     s.set_defaults(fn=cmd_validate)
+    s = sub.add_parser("baseline")
+    s.add_argument("out")
+    s.add_argument("--to", help="output file (default OUT/baseline_contract.json)")
+    s.add_argument("--z", type=float, default=3.0, help="width of the drift band in standard errors (default 3)")
+    s.add_argument("--halt", action="store_true", help="drift rules stop the pipeline instead of warning")
+    s.set_defaults(fn=cmd_baseline)
+
     s = sub.add_parser("eda")
     s.add_argument("out")
+    s.add_argument("--ignore-halt", action="store_true", help="run even though a contract rule marked 'halt' failed")
     s.add_argument("--target")
     s.add_argument("--time")
     s.add_argument("--no-charts", action="store_true")
@@ -460,6 +487,7 @@ def main(argv=None):
     s.add_argument("--target")
     s.add_argument("--time")
     s.add_argument("--no-charts", action="store_true")
+    s.add_argument("--contract", help="data contract JSON, for example a baseline from an earlier batch")
     load_args(s)
     s.set_defaults(fn=cmd_run)
     a = ap.parse_args(argv)

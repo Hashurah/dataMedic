@@ -14,7 +14,7 @@ import pandas as pd
 from . import charts
 from . import stats as st
 from .clean import read_str_csv
-from .common import ROW_ID, load_config, merged_config, optional, read_json, write_json
+from .common import ROW_ID, DataMedicError, load_config, merged_config, optional, read_json, write_json
 from .profile import name_has
 from .validate import typed_view
 
@@ -26,9 +26,25 @@ def _rel(out_dir, p):
     return os.path.relpath(p, out_dir).replace("\\", "/") if p else None
 
 
+def halting_rules(out_dir):
+    """Contract rules with on_fail 'halt' that failed in the last validation."""
+    p = os.path.join(out_dir, "audit", "validation_results.json")
+    if not os.path.exists(p):
+        return []
+    rules = (read_json(p).get("contract") or {}).get("rules", [])
+    return [r for r in rules if r.get("on_fail") == "halt" and not r.get("passed")]
+
+
 class EDA:
-    def __init__(self, out_dir, target=None, time_col=None, cfg=None, charts_on=True):
+    def __init__(self, out_dir, target=None, time_col=None, cfg=None, charts_on=True, ignore_halt=False):
         self.out = out_dir
+        if not ignore_halt:
+            halted = halting_rules(out_dir)
+            if halted:
+                raise DataMedicError("Analysis stopped: contract rules marked on_fail 'halt' failed in validation ("
+                                     + "; ".join(f"{r['id']} {r['rule']} {r.get('column', '')}: {r['detail']}"
+                                                 for r in halted[:5])
+                                     + "). Fix the data or the contract and validate again, or pass --ignore-halt.")
         self.cfg = merged_config(cfg)
         self.ec = self.cfg["eda"]
         self.seed = self.cfg.get("seed", 42)
@@ -340,6 +356,8 @@ class EDA:
             res["rule"] = "listed when the robust distance exceeds the cutoff"
         else:
             return {"status": "not run: needs scipy or scikit-learn"}
+        if ac.get("write_row_scores", True):
+            res["scores_file"] = self.write_row_scores(scores, flagged, cut)
         top = scores[flagged].sort_values(scores.columns[0], ascending=False).head(ac["max_rows_listed"])
         rows = []
         for idx, r in top.iterrows():
@@ -365,6 +383,192 @@ class EDA:
         elif os.path.exists(p):
             os.remove(p)
         return res
+
+    # ------------------------------------------------------------ missing dates
+    def missing_dates(self):
+        """Why dates are missing, and whether the missing ones cluster. Analysis only: nothing is filled.
+
+        Reasons come from the audit trail (blank in the source, unreadable, ambiguous day/month order, set missing
+        by a rule). Clustering is tested along every order the rows have (file order, numeric identifiers) with a
+        runs test: an ingestion outage leaves long runs of missing dates, chance leaves short ones. Missing dates are
+        placed in time (period, weekday) only when an order key tracks the date closely; otherwise the date of a
+        missing value is unknown and the report says so."""
+        cfg = self.cfg.get("missing_dates", {})
+        out = []
+        for c, info in self.schema["columns"].items():
+            if info["type"] not in ("date", "datetime") or info.get("added_by_cleaning"):
+                continue
+            t = pd.to_datetime(self.df[c], errors="coerce")
+            if getattr(t.dt, "tz", None) is not None:
+                t = t.dt.tz_convert(None)
+            miss = t.isna()
+            rec = {"column": c, "rows": int(len(t)), "missing": int(miss.sum()),
+                   "missing_pct": round(100 * float(miss.mean()), 2) if len(t) else 0.0}
+            if not miss.any() or miss.all():
+                rec["status"] = "no missing dates" if not miss.any() else "every date is missing"
+                out.append(rec)
+                continue
+            rec["reasons"] = self._date_missing_reasons(c, miss)
+            rec["orders"] = []
+            for name, key in self._order_keys():
+                o = self._missing_order_test(name, key, t, miss)
+                if o:
+                    rec["orders"].append(o)
+                    self.add_test("missing dates", {"test": "Wald-Wolfowitz runs test",
+                                                    "p_value": o["runs_test"]["p_value"], "statistic": o["runs_test"]["z"]},
+                                  variables=[c, name], question=f"are missing {c} values clustered along {name}?")
+            best = max(rec["orders"], key=lambda o: abs(o.get("date_rank_correlation") or 0), default=None)
+            thr = cfg.get("chronological_rho", 0.9)
+            if best and abs(best.get("date_rank_correlation") or 0) >= thr:
+                rec["placement"] = self._place_missing_dates(c, best["order"], t, miss)
+            else:
+                rho = abs(best.get("date_rank_correlation") or 0) if best else None
+                rec["placement"] = {"status": "not possible", "why": "no column orders the rows in time "
+                                    f"(best rank correlation with the date {rho if rho is None else round(rho, 3)}, "
+                                    f"needs {thr}), so a missing date cannot be placed in a period and filling it from "
+                                    "neighbouring rows would invent it"}
+            out.append(rec)
+        self.res["missing_dates"] = out
+
+    def _order_keys(self):
+        keys = [("file order", self.df[ROW_ID].astype(float))]
+        for k in sorted(self.ids):
+            if k not in self.df.columns:
+                continue
+            v = pd.to_numeric(self.df[k], errors="coerce")
+            if v.notna().mean() < 0.95:  # codes such as TXN-00042: use the trailing number
+                v = pd.to_numeric(self.df[k].astype("string").str.extract(r"(\d+)\s*$")[0], errors="coerce")
+            if v.notna().mean() >= 0.95 and v.nunique() >= 0.9 * v.notna().sum():
+                ok = v.notna()
+                if v[ok].rank().corr(keys[0][1][ok].rank()) > 0.999:
+                    continue  # same order as the file: testing it again adds nothing
+                keys.append((k, v.astype(float)))
+        return keys
+
+    def _date_missing_reasons(self, c, miss):
+        from .common import date_candidates
+        ids = set(self.df.loc[miss, ROW_ID].astype(int))
+        reasons = {}
+        last = {}
+        p = os.path.join(self.out, "audit", "cell_changes.csv")
+        if os.path.exists(p):
+            ch = read_str_csv(p)
+            ch = ch[(ch["column"] == c) & (ch["new_value"] == "")]
+            ch = ch[ch[ROW_ID].astype(int).isin(ids)]
+            last = {int(r): (op, old) for r, op, old in zip(ch[ROW_ID], ch["op_id"], ch["old_value"])}
+        log = read_json(os.path.join(self.out, "audit", "transformation_log.json"))["operations"]
+        log = {e["op_id"]: e for e in log}
+        for rid in ids:
+            if rid not in last:
+                why = "blank in the source"
+            else:
+                op_id, old = last[rid]
+                e = log.get(op_id, {})
+                if e.get("op") == "convert_type":
+                    cand = date_candidates(old, (e.get("params") or {}).get("allow_compact", False))
+                    why = ("ambiguous day/month order" if "dmy" in cand and "mdy" in cand and cand["dmy"] != cand["mdy"]
+                           else "not readable as a date")
+                elif e.get("op") == "standardize_missing":
+                    why = "placeholder text"
+                else:
+                    why = (e.get("params") or {}).get("reason") or e.get("op", "other step")
+                why = f"{why} ({op_id})"
+            reasons[why] = reasons.get(why, 0) + 1
+        n = int(miss.sum())
+        return [{"reason": k, "rows": v, "pct_of_missing": round(100 * v / n, 1)}
+                for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])]
+
+    def _missing_order_test(self, name, key, t, miss):
+        ok = key.notna()
+        if ok.sum() < 20:
+            return None
+        order = key[ok].sort_values(kind="stable").index
+        x = miss.loc[order].to_numpy().astype(int)
+        n, n1 = len(x), int(x.sum())
+        n0 = n - n1
+        if n1 == 0 or n0 == 0:
+            return None
+        runs = 1 + int((x[1:] != x[:-1]).sum())
+        mu = 2 * n0 * n1 / n + 1
+        var = 2 * n0 * n1 * (2 * n0 * n1 - n) / (n ** 2 * (n - 1))
+        z = (runs - mu) / math.sqrt(var) if var > 0 else 0.0
+        p = math.erfc(abs(z) / math.sqrt(2))
+        longest, cur = 0, 0
+        for v in x:
+            cur = cur + 1 if v else 0
+            longest = max(longest, cur)
+        # longest run expected by chance: about log(n0 * share) / log(1 / share)
+        share = n1 / n
+        exp_long = math.log(n * (1 - share)) / math.log(1 / share) if 0 < share < 1 else None
+        dated = ok & ~miss
+        rho = float(key[dated].rank().corr(t[dated].rank())) if dated.sum() >= 10 else None
+        dec = pd.qcut(key[ok].rank(method="first"), 10, labels=False)
+        by_dec = miss[ok].groupby(dec).mean()
+        o = {"order": name, "date_rank_correlation": None if rho is None or np.isnan(rho) else round(rho, 4),
+             "runs_test": {"runs": runs, "expected_runs": round(mu, 1), "z": round(z, 3), "p_value": p,
+                           "reading": "clustered (fewer, longer runs than chance)" if z < 0 and p < self.ec["alpha"]
+                           else "spread out more evenly than chance" if z > 0 and p < self.ec["alpha"]
+                           else "consistent with missing at random positions"},
+             "longest_missing_run": longest,
+             "longest_run_expected_by_chance": None if exp_long is None else round(exp_long, 1),
+             "missing_pct_by_tenth": [round(100 * float(v), 1) for v in by_dec.tolist()]}
+        if st.have_scipy():
+            tab = pd.crosstab(dec, miss[ok])
+            if tab.shape[1] == 2:
+                chi2, pp, dof, _, v = st.cramers_v(tab)
+                o["tenths_chi_square"] = {"chi2": round(float(chi2), 3), "dof": int(dof), "p_value": float(pp),
+                                          "cramers_v": round(float(v), 4)}
+        return o
+
+    def _place_missing_dates(self, c, order_name, t, miss):
+        key = dict(self._order_keys())[order_name]
+        ok = key.notna()
+        idx = key[ok].sort_values(kind="stable").index
+        # a missing date sits between its dated neighbours in this order; the earlier neighbour's date stands in
+        placed = t.loc[idx].ffill()
+        known = placed.notna()
+        frame = pd.DataFrame({"t": placed[known], "missing": miss.loc[idx][known]})
+        span = (frame["t"].max() - frame["t"].min()).days
+        per = "M" if span > 730 else "W" if span > 90 else "D"
+        frame["period"] = frame["t"].dt.to_period(per).astype(str)
+        frame["weekday"] = frame["t"].dt.day_name()
+        by_p = frame.groupby("period")["missing"].agg(["mean", "size"])
+        top = by_p.sort_values("mean", ascending=False).head(5)
+        res = {"status": "placed by neighbouring rows", "order": order_name,
+               "method": "each missing date takes the date of the previous dated row in this order (approximate)",
+               "periods": int(len(by_p)),
+               "highest_missing_periods": [{"period": k, "missing_pct": round(100 * float(r["mean"]), 1),
+                                            "rows": int(r["size"])} for k, r in top.iterrows()],
+               "missing_pct_by_weekday": {k: round(100 * float(v), 1)
+                                          for k, v in frame.groupby("weekday")["missing"].mean().items()}}
+        if st.have_scipy():
+            tab = pd.crosstab(frame["weekday"], frame["missing"])
+            if tab.shape == (7, 2) or (tab.shape[0] >= 2 and tab.shape[1] == 2):
+                chi2, pp, dof, _, v = st.cramers_v(tab)
+                res["weekday_chi_square"] = {"chi2": round(float(chi2), 3), "dof": int(dof), "p_value": float(pp),
+                                             "cramers_v": round(float(v), 4)}
+                self.add_test("missing dates", {"test": "chi-square", "p_value": float(pp), "statistic": float(chi2)},
+                              variables=[c, "weekday"], question=f"does the missing share of {c} differ by weekday?")
+        return res
+
+    def write_row_scores(self, scores, listed, cut):
+        """One row per scored record, in each method's own units plus its percentile within this dataset. The
+        scores rank rows from typical to unusual; they are not probabilities of error and are not comparable
+        between datasets. Rows with fewer than half their measures recorded are not scored."""
+        out = pd.DataFrame({ROW_ID: self.df.loc[scores.index, ROW_ID].astype(int).values})
+        for c in scores.columns:
+            v = scores[c].to_numpy()
+            out[c] = np.round(v, 6)
+            out[f"{c}_percentile"] = np.round(pd.Series(v).rank(pct=True).to_numpy() * 100, 2)
+        if "robust_distance_sq" in scores.columns and cut:
+            out["beyond_robust_cutoff"] = (scores["robust_distance_sq"] > cut).to_numpy()
+        out["listed_as_anomaly"] = listed.reindex(scores.index).fillna(False).to_numpy()
+        p = os.path.join(self.out, "analysis", "anomaly_scores.csv")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        out.sort_values(out.columns[1], ascending=False).to_csv(p, index=False, encoding="utf-8", lineterminator="\n")
+        return {"file": "analysis/anomaly_scores.csv", "rows": int(len(out)), "columns": list(out.columns),
+                "note": "relative scores within this dataset (higher is more unusual), not probabilities of error; "
+                        "use the percentile columns to compare methods"}
 
     def time_series(self):
         if not self.time:
@@ -580,8 +784,32 @@ class EDA:
                                        "effect_size": es, "highest_median": [hi_, med[hi_]],
                                        "lowest_median": [lo_, med[lo_]], "group_sizes": g["group_sizes"]},
                           "caveat": "groups may differ in other ways too (confounding)"})
+        for md in self.res.get("missing_dates", []):
+            for o in md.get("orders", []):
+                t = next((t for t in self.tests if t.get("family") == "missing dates"
+                          and t.get("variables") == [md["column"], o["order"]]), None)
+                if t and t["significant_after_correction"] and o["runs_test"]["z"] < 0:
+                    cands.append({"type": "missing data pattern", "score": min(1.0, abs(o["runs_test"]["z"]) / 10),
+                                  "variables": [md["column"], o["order"]],
+                                  "title": f"Missing {md['column']} values come in runs along {o['order']}",
+                                  "evidence": {"runs": o["runs_test"]["runs"],
+                                               "expected_runs": o["runs_test"]["expected_runs"],
+                                               "q_value": t["q_value_bh"],
+                                               "longest_missing_run": o["longest_missing_run"],
+                                               "longest_run_expected_by_chance": o["longest_run_expected_by_chance"]},
+                                  "caveat": "runs can come from batch loading or a source system outage; check the "
+                                            "rows in the longest run before treating them as one cause"})
+            wk = (md.get("placement") or {}).get("weekday_chi_square")
+            t = next((t for t in self.tests if t.get("variables") == [md["column"], "weekday"]), None)
+            if wk and t and t["significant_after_correction"] and wk["cramers_v"] >= 0.1:
+                cands.append({"type": "missing data pattern", "score": wk["cramers_v"],
+                              "variables": [md["column"], "weekday"],
+                              "title": f"The share of missing {md['column']} values differs by weekday",
+                              "evidence": {**wk, "q_value": t["q_value_bh"],
+                                           "missing_pct_by_weekday": md["placement"]["missing_pct_by_weekday"]},
+                              "caveat": "missing dates are placed by their neighbours' dates, so this is approximate"})
         for s in self.res.get("segments", []):
-            top, t20, t10 = (s.get("top_share_pct") or 0), (s.get("top20pct_levels_share_pct") or 0), \
+            top, t20, t10 =(s.get("top_share_pct") or 0), (s.get("top20pct_levels_share_pct") or 0), \
                 (s.get("top10pct_entities_share_pct") or 0)
             even = 100 / s["levels"] if s.get("levels") else 0
             if (top >= 40 and top >= 1.5 * even) or t20 >= 70 or t10 >= 50:
@@ -642,6 +870,7 @@ class EDA:
         self.bivariate()
         self.multivariate()
         self.time_series()
+        self.missing_dates()
         self.segments()
         self.target_checks()
         self.correct_and_rank()

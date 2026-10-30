@@ -230,7 +230,7 @@ def lineage_svg(stages, start, end):
         if info["columns_removed"]:
             bits.append(f"{info['columns_removed']} columns removed")
         if info["columns_added"]:
-            bits.append(f"{info['columns_added']} indicator columns added")
+            bits.append(f"{info['columns_added']} columns added")
         nodes.append((f"{name.capitalize()} ({', '.join(info['ops'])})", "; ".join(bits) or "no values changed", "step"))
     nodes.append(("Final dataset", f"{end['rows']:,} rows · {end['columns']} columns · validation {end['status']}", "end"))
     w, bh, gap = 640, 50, 22
@@ -277,6 +277,7 @@ def stage_summary(log, removed):
             info["changed"] += int(e.get("affected", 0) or 0)
         if e["op"] == "impute" and (e.get("statistical_basis") or {}).get("indicator_column"):
             info["columns_added"] += 1
+        info["columns_added"] += len(e.get("added_columns") or [])
     return out
 
 
@@ -681,6 +682,8 @@ def build(d, out, interactive=False):
             special.append("restored rows come back with their original values; no other step is applied to them")
         if x["op"] == "impute" and (x.get("statistical_basis") or {}).get("indicator_column"):
             special.append(f"its indicator column {x['statistical_basis']['indicator_column']} is dropped on restore")
+        if x.get("added_columns"):
+            special.append(f"the columns it added ({', '.join(x['added_columns'])}) are dropped on restore")
         rec_rows.append([x["op_id"], x["op"], x.get("column", ""), f"{x.get('affected', 0):,}", x.get("reversal", ""),
                          "; ".join(special) or "none", Raw(f"<code>dm restore OUT --op {_h(x['op_id'])}</code>")])
     S.append(_table(["Step", "Operation", "Column", "Changed", "Where the originals are", "Needs care", "Undo this step"],
